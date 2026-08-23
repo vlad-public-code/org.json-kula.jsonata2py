@@ -1,0 +1,49 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Test / coverage
+.pytest_cache/
+.hypothesis/
+.benchmarks/
+.coverage
+htmlcov/
+
+# Performance-gate baselines are per-machine: timings are not portable, and
+# a baseline recorded elsewhere is worse than none. Record your own with
+# `pytest tests/benchmarks -m perfgate --perf-record`.
+tests/benchmarks/perf_baseline.json
+
+# Type checking
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors
+.idea/
+.vscode/
+
+# GitHub Pages / Jekyll
+docs/_site/
+docs/.jekyll-cache/
+docs/.jekyll-metadata
+docs/design/
+docs/vendor/
+docs/.bundle/
+
+# OS
+.DS_Store
+Thumbs.db

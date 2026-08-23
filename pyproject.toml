@@ -1,0 +1,131 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jsonata2py"
+version = "0.1.0"
+description = "A JSONata-to-Python translator: parse once, translate to Python source, compile with the host compiler, evaluate many times."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Vlad", email = "vlad.public.code@gmail.com" },
+]
+keywords = ["jsonata", "json", "query", "transformation", "translator", "transpiler", "jsonata2py"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing",
+    "Typing :: Typed",
+]
+dependencies = [
+    "regex>=2023.0.0",
+]
+
+[project.urls]
+Homepage = "https://vlad-public-code.github.io/org.json-kula.jsonata2py/"
+Documentation = "https://vlad-public-code.github.io/org.json-kula.jsonata2py/"
+Repository = "https://github.com/vlad-public-code/org.json-kula.jsonata2py"
+Issues = "https://github.com/vlad-public-code/org.json-kula.jsonata2py/issues"
+Changelog = "https://github.com/vlad-public-code/org.json-kula.jsonata2py/releases"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-benchmark>=4.0",
+    "hypothesis>=6.90",
+    "mypy>=1.8",
+    "ruff>=0.6",
+]
+# Comparison targets for tests/benchmarks/test_performance_comparison.py
+# (design spec section 11). Not required to use this library -- each is
+# skipped individually if not installed.
+#
+# NOTE: jsonata-rs is deliberately NOT listed here. It installs a top-level
+# module named `jsonata`, which is the same name jsonata-python installs, so
+# the two overwrite each other and cannot coexist in one environment. To
+# benchmark against jsonata-rs, install it into a separate virtualenv; the
+# comparison suite detects whichever of the two owns `jsonata` and skips the
+# other. (jsonata-rs also ships no Windows wheel, so it needs a Rust
+# toolchain there.)
+benchmark = [
+    "jsonata-python",
+    "jsonatapy",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jsonata2py"]
+
+# Ship the tests and the official JSONata suite in the sdist so downstream
+# packagers can verify a build. Explicit rather than implicit: without a git
+# checkout hatchling would otherwise sweep in whatever happens to be present.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/docs",
+    "/README.md",
+    "/LICENSE",
+    "/PERFORMANCE-REVIEW.md",
+    "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not benchmark and not perfgate'"
+markers = [
+    "benchmark: performance comparison tests (design spec section 11) -- opt-in, not a gate; run with `pytest tests/benchmarks -m benchmark`",
+    "perfgate: loose performance regression gate against a per-machine baseline -- opt-in; record with `pytest tests/benchmarks -m perfgate --perf-record`, then run with `pytest tests/benchmarks -m perfgate`",
+]
+
+[tool.mypy]
+strict = true
+# Check against the declared floor, not the interpreter that happens to be
+# running -- this is what catches typing/stdlib features newer than 3.11.
+python_version = "3.11"
+exclude = ["tests/resources"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["tests/resources"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # import sorting
+    "UP",   # pyupgrade -- keep idioms current with the 3.11 floor
+    "B",    # bugbear
+    "C4",   # comprehension hygiene
+    "SIM",  # simplification
+    "RUF",
+]
+ignore = [
+    "E501",    # line length is handled by the formatter, not the linter
+    "B008",    # call-in-default is used deliberately by the runtime adapters
+    "SIM108",  # ternaries are not always clearer than an if/else here
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The generated-code tests assert on exact source text; import order and
+# unused-import rules do not apply to fixture strings.
+"tests/**" = ["B011"]
+
+# The `regex` package ships no type stubs (it is a C extension with no
+# py.typed marker). Nothing to install -- this states the fact instead of
+# leaving two permanent errors in a strict run.
+[[tool.mypy.overrides]]
+module = ["regex"]
+ignore_missing_imports = true

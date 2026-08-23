@@ -1,0 +1,64 @@
+---
+# Front matter (even empty) makes Jekyll process this file so the Liquid below resolves to
+# absolute URLs. `sitemap: false` keeps llms.txt itself out of the generated sitemap.
+sitemap: false
+---
+# jsonata2py
+
+> jsonata2py is a Python 3.11+ library that translates [JSONata](https://jsonata.org)
+> expressions into native Python source at runtime. Each expression is parsed, optimised,
+> translated to Python source, compiled in-memory (`compile()` + `exec()`), and returned as a
+> ready-to-call, thread-safe `CompiledExpression`. Measured ~26x faster evaluation than the
+> pure-Python reference interpreter (`jsonata-python`), and faster than both Rust-backed
+> alternatives (`jsonatapy`, `jsonata-rs`) when querying Python objects directly, on a
+> realistic analytical benchmark. All 1,281 files of the official JSONata test suite pass.
+> MIT licensed.
+
+Use it when you evaluate the same JSONata expression many times and want compiled-source
+throughput instead of a pure AST interpreter — compile once at startup, evaluate on the hot path.
+Requires Python 3.11+ and the `regex` package. Install: `pip install jsonata2py`.
+
+Key facts:
+- **Compile then evaluate:** `jsonata.compile("Account.Order.Product.Price * 1.2")` →
+  `CompiledExpression`; `expr.evaluate(data)` → a plain Python value (`dict`/`list`/`str`/`int`/
+  `float`/`bool`/`None`/`jsonata.MISSING`). The instance is thread-safe and reusable; don't call
+  `compile()` on the hot path.
+- **Bindings:** inject `$name` values and `$name(...)` functions per-evaluation
+  (`JsonataBindings`) or permanently (`assign` / `register_function`); per-evaluation wins on a
+  name clash. A bound function is also a first-class function *value* — passable to `$map`,
+  piped through `~>`, handed to another bound function.
+- **JSONata libraries:** `factory.compile_library(definitionExpression)` → `JsonataLibrary`, with
+  `.functions` → `dict[str, JsonataBoundFunction]` and `.constants` → `dict[str, Any]`.
+  A definition is ordinary JSONata that binds names and returns the ones to export
+  (`["gross", "format", "vatRate"]`); each lands in one dict or the other by what it evaluated to.
+  Write a set of bindings once in JSONata — recursive, mutually recursive, closing over private
+  helpers — then apply the whole set to any expression with `expr.use_library(lib)` (permanent) or
+  `JsonataBindings().use_library(lib)` (per evaluation). A definition must be self-contained: a
+  name it neither binds nor takes from the standard library must be supplied through
+  `JsonataLibraryOptions.with_bindings`, or the build fails.
+- **Two exceptions:** `JsonataCompilationError` (bad expression) and `JsonataEvaluationError`
+  (bad input / runtime error, including the `U1001` timeout from `set_timeout`).
+
+## Documentation
+
+- [Documentation]({{ '/' | absolute_url }}): overview, requirements, getting started, bindings, performance, thread safety, and the compile→optimize→translate→load architecture.
+- [Getting started]({{ '/#getting-started' | absolute_url }}): install, compile an expression, and evaluate against data.
+- [Bindings]({{ '/#bindings' | absolute_url }}): per-evaluation vs permanent bindings, implementing a bound function, and the function-signature syntax.
+- [JSONata libraries]({{ '/#jsonata-libraries' | absolute_url }}): write a set of bindings once as a JSONata definition expression and apply it to any expression — exported functions and constants, private helpers, signatures, and lifetime.
+- [Performance]({{ '/#performance' | absolute_url }}): measured throughput vs `jsonata-python` and `jsonatapy`, and how to reproduce it.
+- [Architecture]({{ '/#architecture-overview' | absolute_url }}): the pipeline and package structure (`parser`, `optimizer`, `translator`, `runtime`, `loader`).
+- [Source on GitHub]({{ site.github.repository_url }}): code and README. MIT licensed.
+
+## Built-in function references
+
+- [Numeric functions]({{ '/numeric.md' | absolute_url }}): implementation notes for `$number`, `$round`, `$random`, `$formatBase`, `$formatNumber`, `$formatInteger`, `$parseInteger`.
+- [String functions]({{ '/string.md' | absolute_url }}): implementation notes for `$string*`, `$length`, `$substring*`, `$match`, `$replace`, `$split`, `$join`, `$pad`, `$base64*`, `$encodeUrl*`, and more.
+- [Date/time functions]({{ '/datetime.md' | absolute_url }}): implementation notes for `$now`, `$millis`, `$fromMillis`, `$toMillis`, including XPath/XQuery picture-string formatting and parsing.
+- [Function-library design]({{ '/design/function-library.md' | absolute_url }}): the design behind `compile_library` — how a JSONata definition expression becomes a set of callable, exportable functions.
+
+## Related projects
+
+- [jsonata-jvm-compiler](https://vlad-public-code.github.io/org.json-kula.jsonata-jvm-compiler/): the Java 21 sibling this library is ported from — same pipeline (parse → optimise → translate → compile → evaluate), same official-suite acceptance gate, a different host runtime.
+- [tracked-json](https://vlad-public-code.github.io/org.json-kula.tracked-json/): a Jackson `JsonNode` wrapper that tracks each node's absolute `JsonPointer` through every navigation; includes RFC 9535 JSONPath and RFC 6902 JSON Patch.
+- [Valem](https://vlad-public-code.github.io/org.json-kula.valem/): a deterministic reactive computation runtime for AI-generated structured data models, built on the Java sibling compiler. [llms.txt](https://vlad-public-code.github.io/org.json-kula.valem/llms.txt).
+- [Valem sandbox](https://valem.run/): the hosted, zero-install demo.

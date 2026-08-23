@@ -1,0 +1,12 @@
+title: jsonata2py
+description: A Python 3.11+ library that translates JSONata expressions into native Python source at runtime
+remote_theme: pages-themes/cayman@v0.2.0
+plugins:
+  - jekyll-remote-theme
+  # sitemap.xml for Search Console. Uses site.url (auto-set from site.github on GitHub Pages).
+  - jekyll-sitemap
+# The design specs are internal engineering documents (the port's own design record, and the Rust
+# backend's), not public docs pages -- excluded so they aren't built as orphan pages nobody links to.
+exclude:
+  - porting-design-spec.md
+  - rust-backend-design-spec.md
