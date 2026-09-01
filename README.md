@@ -44,7 +44,7 @@ expr.evaluate({
 - [Thread safety](#thread-safety) · [Architecture](#architecture-overview) · [Package structure](#package-structure) · [License](#license)
 
 Port of [`jsonata-jvm-compiler`](https://github.com/vlad-public-code/org.json-kula.jsonata-jvm-compiler)
-(Java) — same pipeline, same design, a different host runtime. That sibling is the library powering [valem.run](https://valem.run)'s reactive computation engine.
+(Java) — same pipeline, same design, a different host runtime.
 
 ## Requirements
 
@@ -717,18 +717,6 @@ expression once and exits. It is a pure-Python AST interpreter, which makes it e
 to read and debug, but it evaluates ~47x slower than jsonata2py here *and* compiles
 more slowly, so there is no workload shape where it is the faster choice.
 
-## Sibling implementations
-
-The same parse → optimise → translate → compile pipeline exists for three host runtimes:
-
-| Runtime | Project | Host code it generates | Speedup vs. that runtime's reference interpreter |
-|---|---|---|---|
-| JVM | [jsonata-jvm-compiler](https://github.com/vlad-public-code/org.json-kula.jsonata-jvm-compiler) (Java 21) | Java source, compiled in-memory by `javac` | ~40× vs [JSONata4Java](https://github.com/IBM/JSONata4Java) |
-| JavaScript | [jsonata2js](https://github.com/vlad-public-code/org.json-kula.jsonata2js) | a JS function, loaded via `node:vm`'s `compileFunction` | ~45–56× vs [`jsonata`](https://www.npmjs.com/package/jsonata) |
-| Python | [jsonata2py](https://pypi.org/project/jsonata2py/) (this project) | Python source, compiled by the host `compile()` | ~47× vs [`jsonata-python`](https://pypi.org/project/jsonata-python/) |
-
-The JVM implementation is the original, and is the compiler behind [valem.run](https://valem.run/)'s reactive computation engine.
-
 ## Thread safety
 
 A `JsonataExpressionFactory` instance and all `CompiledExpression` instances it produces are fully thread-safe. `evaluate()` is stateless — each call reads the input independently and returns a new value without modifying any shared state. Per-evaluation state (bindings overlay, timeout deadline, call depth) lives in a `contextvars.ContextVar`, which is also what makes evaluation correct across `asyncio` tasks, not just OS threads: each task runs in its own copied context.
@@ -776,6 +764,18 @@ expression string
 | `jsonata2py.translator` | `Translator` and the code-generation helpers it uses |
 | `jsonata2py.runtime` | Runtime support: `core`, `context` (the `ContextVar`-based evaluation state), `lambdas`, `sequences`, `signature`, `values`, plus `strings/`, `numeric/`, `datetime/` built-in packages |
 | `jsonata2py.loader` | `ExpressionLoader` |
+
+## Sibling implementations
+
+The same parse → optimise → translate → compile pipeline exists for three host runtimes:
+
+| Runtime | Project | Host code it generates | Speedup vs. that runtime's reference interpreter |
+|---|---|---|---|
+| JVM | [jsonata-jvm-compiler](https://github.com/vlad-public-code/org.json-kula.jsonata-jvm-compiler) (Java 21) | Java source, compiled in-memory by `javac` | ~40× vs [JSONata4Java](https://github.com/IBM/JSONata4Java) |
+| JavaScript | [jsonata2js](https://github.com/vlad-public-code/org.json-kula.jsonata2js) | a JS function, loaded via `node:vm`'s `compileFunction` | ~45–56× vs [`jsonata`](https://www.npmjs.com/package/jsonata) |
+| Python | [jsonata2py](https://pypi.org/project/jsonata2py/) (this project) | Python source, compiled by the host `compile()` | ~47× vs [`jsonata-python`](https://pypi.org/project/jsonata-python/) |
+
+The JVM implementation is the original, and is the compiler behind [valem.run](https://valem.run/)'s reactive computation engine.
 
 ## License
 
