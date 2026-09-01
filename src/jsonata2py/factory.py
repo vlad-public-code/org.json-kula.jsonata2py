@@ -33,7 +33,14 @@ from .parser.parser import Parser
 # $eval compiles at evaluation time; compilation costs low milliseconds even
 # in Python, so a bounded LRU cache still pays for itself for tight loops
 # calling $eval on the same expression text repeatedly.
+#
+# Bounded by BOTH an entry count and a total key-text size. $eval's
+# argument is an ordinary JSONata value, so a document can supply the
+# expression text and therefore control the key length: an entry count
+# alone bounds how MANY expressions are retained, not how LARGE they are,
+# which is the same trap tier 2 below already guards against.
 _EVAL_CACHE_LIMIT = 256
+_EVAL_CACHE_MAX_BYTES = 1 << 20
 
 # Repeat compile() is served by two cache tiers, because the constraint
 # they work under is not the same at both levels.
@@ -58,7 +65,10 @@ _EVAL_CACHE_LIMIT = 256
 # contract above; re-executing it into a fresh namespace costs ~40us
 # rather than 7.7ms. Bounded separately and more tightly than tier 1,
 # because a code object for a large expression retains ~40 KiB.
+# Tier 1's values are weakrefs (cheap), but its KEYS are the expression
+# text, so it is byte-bounded for the same reason.
 _COMPILE_CACHE_LIMIT = 512
+_COMPILE_CACHE_MAX_BYTES = 1 << 20
 # Tier 2 is bounded by generated-source bytes, not by an entry count:
 # generated modules differ in size by two orders of magnitude (a 190-line
 # expression generates ~34 KB and retains ~50 KiB cached; `a.b.c`
@@ -107,7 +117,9 @@ class JsonataExpressionFactory:
     def __init__(self) -> None:
         self._loader = ExpressionLoader()
         self._eval_cache: OrderedDict[str, CompiledExpression] = OrderedDict()
+        self._eval_cache_bytes = 0
         self._compile_cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+        self._compile_cache_bytes = 0
         self._code_cache: OrderedDict[str, CompiledModule] = OrderedDict()
         self._code_cache_bytes = 0
         self._compile_cache_lock = threading.Lock()
@@ -135,10 +147,20 @@ class JsonataExpressionFactory:
                 if compiled is None:
                     compiled = self.compile(expr)
                     with self._eval_cache_lock:
+                        # Only charge a key that was not already present:
+                        # two threads can miss concurrently and both
+                        # arrive here with the same text, and the second
+                        # insert overwrites rather than adds.
+                        if expr not in self._eval_cache:
+                            self._eval_cache_bytes += len(expr)
                         self._eval_cache[expr] = compiled
                         self._eval_cache.move_to_end(expr)
-                        while len(self._eval_cache) > _EVAL_CACHE_LIMIT:
-                            self._eval_cache.popitem(last=False)
+                        while self._eval_cache and (
+                            len(self._eval_cache) > _EVAL_CACHE_LIMIT
+                            or self._eval_cache_bytes > _EVAL_CACHE_MAX_BYTES
+                        ):
+                            evicted_key, _ = self._eval_cache.popitem(last=False)
+                            self._eval_cache_bytes -= len(evicted_key)
                 return compiled.evaluate(None if ctx is MISSING else ctx)
             except JsonataCompilationError as e:
                 # T1005 means the text parsed but named a non-function --
@@ -200,16 +222,25 @@ class JsonataExpressionFactory:
                 entry_point = cached.entry_point_ref()
                 if entry_point is None:
                     del self._compile_cache[expression]
+                    self._compile_cache_bytes -= len(expression)
                 else:
                     source_jsonata = cached.source_for(expression)
                     self._compile_cache.move_to_end(expression)
         if entry_point is None:
             entry_point, source_jsonata = self._instantiate(expression)
             with self._compile_cache_lock:
+                # See the eval cache: charge the key only when it is new,
+                # since concurrent misses can both reach this insert.
+                if expression not in self._compile_cache:
+                    self._compile_cache_bytes += len(expression)
                 self._compile_cache[expression] = _CacheEntry(entry_point, source_jsonata, expression)
                 self._compile_cache.move_to_end(expression)
-                while len(self._compile_cache) > _COMPILE_CACHE_LIMIT:
-                    self._compile_cache.popitem(last=False)
+                while self._compile_cache and (
+                    len(self._compile_cache) > _COMPILE_CACHE_LIMIT
+                    or self._compile_cache_bytes > _COMPILE_CACHE_MAX_BYTES
+                ):
+                    evicted_key, _ = self._compile_cache.popitem(last=False)
+                    self._compile_cache_bytes -= len(evicted_key)
         return self._attach(CompiledExpression(entry_point, source_jsonata or expression))
 
     def _instantiate(self, expression: str) -> tuple[Any, str]:

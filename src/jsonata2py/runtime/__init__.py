@@ -12,4 +12,8 @@ from __future__ import annotations
 from .core import *  # noqa: F403
 from .core import __all__ as _core_all
 
-__all__ = list(_core_all)
+# Lives in signature.py because it is signature-directed argument validation,
+# not a runtime primitive; core.py re-exports nothing else from that module.
+from .signature import call_builtin_ctx
+
+__all__ = [*_core_all, "call_builtin_ctx"]

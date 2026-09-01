@@ -285,10 +285,19 @@ class FunctionCall(AstNode):
     Attributes:
         name: the function name (without leading $)
         args: the argument expressions (may be empty)
+        is_variable: True for `$name(...)`, where the callee is a variable
+            or a built-in; False for a bare `name(...)`, where the callee
+            is a FIELD of the surrounding path step's context. The two are
+            spelled identically once the `$` is stripped but mean different
+            things -- `$o.g()` invokes `$o`'s `g` field while `$o.$g()`
+            invokes the variable `$g` -- so the distinction has to survive
+            parsing. Defaults True so every synthetic construction site
+            keeps the `$name(...)` meaning it already had.
     """
 
     name: str
     args: list[AstNode]
+    is_variable: bool = True
 
 
 @dataclass(frozen=True, slots=True)

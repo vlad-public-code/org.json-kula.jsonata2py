@@ -195,12 +195,34 @@ class TestSequenceHOF:
     def test_fn_sort_scalar(self) -> None:
         assert rt.fn_sort([3, 1, 2]) == [1, 2, 3]
 
-    def test_fn_sort_mixed_types_raises_t2007(self) -> None:
+    def test_fn_sort_mixed_types_raises_d3070(self) -> None:
+        """`$sort` with no comparator reports D3070, verified against the
+        reference interpreter ($sort([1,"a"]) -> D3070). This asserted
+        T2007 before, which is the code the `^(key)` order-by operator
+        reports about its key expression -- see the test below."""
         from jsonata2py.runtime import sequences as seq
 
         with pytest.raises(RuntimeEvaluationError) as e:
             seq.fn_sort([1, "a"], None)
+        assert e.value.error_code == "D3070"
+
+        for bad in ([True, False], [None, 1]):
+            with pytest.raises(RuntimeEvaluationError) as e:
+                seq.fn_sort(bad, None)
+            assert e.value.error_code == "D3070"
+
+    def test_order_by_key_still_reports_t2007_t2008(self) -> None:
+        """The order-by operator keeps its own codes: mixed key types are
+        T2007 and a non-string/number key is T2008."""
+        from jsonata2py.runtime import sequences as seq
+
+        with pytest.raises(RuntimeEvaluationError) as e:
+            seq.fn_sort([{"k": 1}, {"k": "a"}], lambda item: item["k"])
         assert e.value.error_code == "T2007"
+
+        with pytest.raises(RuntimeEvaluationError) as e:
+            seq.fn_sort([{"k": True}], lambda item: item["k"])
+        assert e.value.error_code == "T2008"
 
 
 class TestLambdaValuesAndApply:

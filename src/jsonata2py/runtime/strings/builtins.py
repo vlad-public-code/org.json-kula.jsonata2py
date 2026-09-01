@@ -19,11 +19,41 @@ from __future__ import annotations
 import base64
 from typing import Any
 
+import regex as _regex_mod
+
 from ...errors import _RuntimeEvaluationError as RuntimeEvaluationError
 from .. import core as _core
 from ..values import MISSING, is_function, is_regex
 from . import regex_ops as _regex_ops
 from . import url_codec as _url_codec
+
+# See fn_trim: the literal class jsonata normalises on.
+_TRIM_RUN = _regex_mod.compile(r"[ \t\n\r]+")
+
+# Stands in for jsonata's `limit === undefined` in the $match/$split/$replace
+# match loops, which all read `limit === undefined || count < limit`. Folding
+# the absent case into the comparison keeps one branch out of the per-match
+# loop; `inf` is never reachable as a real limit (a jsonata number literal
+# out of double range is rejected at parse time).
+_INF = float("inf")
+
+
+def _to_uint32(limit: Any) -> int:
+    """ECMAScript ToUint32 -- truncate toward zero, then take the value
+    modulo 2**32. Only `String.prototype.split`'s limit argument needs it
+    (jsonata2js src/runtime/string.js:230); every other JSONata limit is
+    compared as a real number. Callers have already rejected negatives."""
+    f = float(limit)
+    if f != f or f == _INF:  # NaN / Infinity -> 0, per ToUint32
+        return 0
+    return int(f) & 0xFFFFFFFF
+
+
+# See fn_base64decode: everything Node's base64 decoder silently drops, and
+# the URL-safe alias mapping it accepts alongside the standard alphabet.
+_B64_ALIEN = _regex_mod.compile(r"[^A-Za-z0-9+/_-]")
+_B64_URLSAFE = str.maketrans("-_", "+/")
+
 
 # =============================================================================
 # $uppercase / $lowercase
@@ -56,9 +86,18 @@ def fn_trim(arg: Any) -> Any:
         return MISSING
     if not isinstance(arg, str):
         raise RuntimeEvaluationError("T0410", "$trim() function: argument 1 of $trim must be a string")
-    import regex as _re
-
-    return _re.sub(r"\s+", " ", arg).strip()
+    # JSONata collapses runs of exactly these FOUR characters -- not the
+    # Unicode whitespace class. `\s` under `regex`/`re` also matches NBSP,
+    # U+2028, U+3000, \v and \f, all of which JSONata leaves untouched.
+    # Ported from jsonata2js src/runtime/string.js:163-169, including the
+    # trailing step: at most ONE leading and ONE trailing space is
+    # stripped (charAt/substring), which is not str.strip().
+    result = _TRIM_RUN.sub(" ", arg)
+    if result[:1] == " ":
+        result = result[1:]
+    if result[-1:] == " ":
+        result = result[:-1]
+    return result
 
 
 # =============================================================================
@@ -194,48 +233,63 @@ def fn_split(str_: Any, separator: Any, limit: Any = MISSING) -> Any:
             raise RuntimeEvaluationError("T0410", "$split: argument 3 must be a number")
         if float(limit) < 0:
             raise RuntimeEvaluationError("D3020", "$split: limit must be non-negative")
-    lim = -1 if limit is MISSING else int(limit)
 
     if is_regex(separator):
-        pattern = _regex_ops.compiled_of(separator)
+        # Ported from jsonata2js src/runtime/regex.js:291-321. The cursor is
+        # advanced by iter_matches (which owns the zero-length D1004 guard);
+        # note that next() is pulled BEFORE re-testing `limit`, so a limit
+        # does not suppress that D1004.
+        #
+        # `limit` is compared as a REAL number (`count < limit`), never
+        # truncated: $split("a,b,c,d", /,/, 1.5) yields two separators'
+        # worth of splits, not one. `inf` stands in for jsonata's
+        # `limit === undefined`, so the two `limit === undefined ||`
+        # disjunctions collapse to a single comparison.
+        lim = _INF if limit is MISSING else float(limit)
         result: list[str] = []
-        pos = 0
-        count = 0
-        n = len(str_)
-        while pos <= n:
-            if lim >= 0 and count >= lim:
-                break
-            m = pattern.search(str_, pos)
+        if lim > 0:
+            matches = _regex_ops.iter_matches(_regex_ops.compiled_of(separator), str_)
+            m = next(matches, None)
             if m is None:
-                result.append(str_[pos:])
-                break
-            result.append(str_[pos : m.start()])
-            count += 1
-            end = m.end()
-            pos = end if end > m.start() else end + 1
+                result.append(str_)
+            else:
+                start = 0
+                count = 0
+                while m is not None and count < lim:
+                    result.append(str_[start : m.start()])
+                    start = m.end()
+                    m = next(matches, None)
+                    count += 1
+                if count < lim:
+                    result.append(str_[start:])
         return result
 
+    # The plain-string-separator overload is NOT the same loop: jsonata
+    # delegates it to `String.prototype.split(separator, limit)` (see
+    # jsonata2js src/runtime/string.js:230), whose limit argument goes
+    # through ToUint32 -- so 1.5 truncates to 1 and 2**32 + 0.5 wraps to 0.
+    ilim = -1 if limit is MISSING else _to_uint32(limit)
     sep = _core.to_text(separator)
-    result = []
+    strs: list[str] = []
     if sep == "":
-        n = len(str_) if lim < 0 else min(lim, len(str_))
+        n = len(str_) if ilim < 0 else min(ilim, len(str_))
         for k in range(n):
-            result.append(str_[k])
-        return result
+            strs.append(str_[k])
+        return strs
     pos = 0
     count = 0
     while True:
         idx = str_.find(sep, pos)
         if idx < 0:
             break
-        if lim >= 0 and count >= lim:
+        if ilim >= 0 and count >= ilim:
             break
-        result.append(str_[pos:idx])
+        strs.append(str_[pos:idx])
         count += 1
         pos = idx + len(sep)
-    if lim < 0 or count < lim:
-        result.append(str_[pos:])
-    return result
+    if ilim < 0 or count < ilim:
+        strs.append(str_[pos:])
+    return strs
 
 
 # =============================================================================
@@ -269,37 +323,44 @@ def fn_join(arr: Any, separator: Any = MISSING) -> Any:
 def fn_match(str_: Any, pattern: Any, limit: Any = MISSING) -> Any:
     if str_ is MISSING or pattern is MISSING:
         return MISSING
+    # regex.js:153-155 -- $match's own non-negative-limit guard, the D3040
+    # counterpart of $split's D3020 and $replace's D3011. It is checked
+    # AFTER the undefined-subject short-circuit, matching regex.js:150.
+    if limit is not MISSING:
+        if not _core.is_number(limit):
+            raise RuntimeEvaluationError("T0410", "$match: argument 3 must be a number")
+        if float(limit) < 0:
+            raise RuntimeEvaluationError("D3040", "$match: limit must be non-negative")
+    # Compared as a REAL number, never truncated: $match("aaa", /a/, 1.5)
+    # yields TWO matches, because jsonata tests `count < limit` directly.
+    lim = _INF if limit is MISSING else float(limit)
     s = _core.to_text(str_)
 
     if is_function(pattern):
-        lim = 2**31 - 1 if limit is MISSING else int(_core.to_number(limit))
         return _match_with_lambda(s, pattern, lim)
 
     compiled = _regex_ops.compiled_of(pattern) if is_regex(pattern) else _regex_ops.build_literal_regex(
         _core.to_text(pattern)
     )
-    lim = 2**31 - 1 if limit is MISSING else int(_core.to_number(limit))
-    results = []
-    pos = 0
-    count = 0
-    n = len(s)
-    while pos <= n and count < lim:
-        m = compiled.search(s, pos)
-        if m is None:
-            break
-        obj: dict[str, Any] = {
-            "match": m.group(0),
-            "index": m.start(),
-            "groups": [g if g is not None else "" for g in m.groups()],
-        }
-        results.append(obj)
-        count += 1
-        end = m.end()
-        pos = end if end > m.start() else end + 1
-    return results if results else MISSING
+    results: list[dict[str, Any]] = []
+    if lim > 0:
+        # Ported from jsonata2js src/runtime/regex.js:149-170. `groups` holds
+        # the raw group values, so a group that did not participate stays
+        # absent (JSON null) rather than becoming "" -- real jsonata leaves
+        # JavaScript's `undefined` there, which serialises as null.
+        matches = _regex_ops.iter_matches(compiled, s)
+        m = next(matches, None)
+        count = 0
+        while m is not None and count < lim:
+            results.append({"match": m.group(0), "index": m.start(), "groups": list(m.groups())})
+            m = next(matches, None)
+            count += 1
+    # createSequence()/RT.collapse(result, false): no match -> undefined,
+    # exactly one match -> the bare object, not a one-element array.
+    return _core.unwrap(results)
 
 
-def _match_with_lambda(s: str, pattern: Any, limit: int) -> Any:
+def _match_with_lambda(s: str, pattern: Any, limit: float) -> Any:
     """$match with a custom matcher function (not a regex/string pattern).
 
     Protocol (ported from RegexOps.matchWithLambda): the pattern function
@@ -348,7 +409,9 @@ def _match_with_lambda(s: str, pattern: Any, limit: int) -> Any:
         else:
             break
 
-    return results if results else MISSING
+    # Same sequence collapse as the regex path: regex.js:169 applies
+    # RT.collapse to whichever matcher produced the results.
+    return _core.unwrap(results)
 
 
 # =============================================================================
@@ -374,39 +437,51 @@ def fn_replace(str_: Any, pattern: Any, replacement: Any, limit: Any = MISSING) 
     if not is_regex(pattern) and pattern == "":
         raise RuntimeEvaluationError("D3010", "$replace: second argument cannot be an empty string")
     compiled = _regex_ops.compiled_of(pattern) if is_regex(pattern) else _regex_ops.build_literal_regex(pattern)
-    lim = 2**31 - 1 if limit is MISSING else int(limit)
+    # Compared as a REAL number, never truncated (regex.js:270): a limit of
+    # 1.5 replaces TWO matches.
+    lim = _INF if limit is MISSING else float(limit)
 
     from ..lambdas import fn_apply
 
+    # Ported from jsonata2js src/runtime/regex.js:247-285. The zero-length
+    # guard lives in iter_matches and fires only on a *subsequent* empty
+    # match, so `$replace("abc", /$/, "-")` -> "abc-" is legal while
+    # `$replace("abc", /^/, "-")` still raises D1004.
     out: list[str] = []
     pos = 0
-    count = 0
-    n = len(s)
-    while pos <= n and count < lim:
-        m = compiled.search(s, pos)
+    if lim > 0:
+        matches = _regex_ops.iter_matches(compiled, s)
+        m = next(matches, None)
         if m is None:
-            break
-        start, end = m.start(), m.end()
-        if end == start:
-            raise RuntimeEvaluationError("D1004", "Regular expression matches zero length string")
-        out.append(s[pos:start])
-        match_str = m.group(0)
-        if is_function(replacement):
-            match_obj = {
-                "match": match_str,
-                "index": start,
-                "groups": [g if g is not None else "" for g in m.groups()],
-            }
-            rep_result = fn_apply(replacement, match_obj)
-            if rep_result is not MISSING and not isinstance(rep_result, str):
-                raise RuntimeEvaluationError("D3012", "$replace: replacement function must return a string")
-            out.append(rep_result if isinstance(rep_result, str) else "")
+            out.append(s)
         else:
-            out.append(_expand_replacement(_core.to_text(replacement), m))
-        count += 1
-        pos = end
-    if pos <= n:
-        out.append(s[pos:])
+            count = 0
+            is_fn = is_function(replacement)
+            template = None if is_fn else _core.to_text(replacement)
+            while m is not None and count < lim:
+                start = m.start()
+                out.append(s[pos:start])
+                if template is None:
+                    # regex.js:186-190: the function replacer is handed the
+                    # RAW matcher-closure object -- {match, start, end,
+                    # groups, next}, next() included -- NOT the remapped
+                    # {match, index, groups} shape $match returns, and with
+                    # non-participating groups left null rather than "".
+                    rep_result = fn_apply(replacement, _regex_ops.match_closure(compiled, s, m))
+                    if not isinstance(rep_result, str):
+                        # Includes a replacer that returned nothing: jsonata
+                        # tests `typeof replacedWith === 'string'`, which
+                        # `undefined` fails just like a number would.
+                        raise RuntimeEvaluationError("D3012", "$replace: replacement function must return a string")
+                    out.append(rep_result)
+                else:
+                    out.append(_expand_replacement(template, m))
+                pos = m.end()
+                count += 1
+                m = next(matches, None)
+            out.append(s[pos:])
+    else:
+        out.append(s)
     return "".join(out)
 
 
@@ -541,7 +616,19 @@ def fn_base64encode(str_: Any) -> Any:
         return MISSING
     if not isinstance(str_, str):
         raise RuntimeEvaluationError("T0410", "$base64encode: argument must be a string")
-    data = str_.encode("latin-1", errors="replace")
+    # btoa / Buffer.from(str, 'binary') semantics (jsonata2js
+    # src/runtime/codec.js:15): every UTF-16 code UNIT contributes its low
+    # byte, `unit & 0xFF`. For code points below U+0100 that is exactly a
+    # latin-1 encode -- one C call, and the case that actually occurs. For
+    # anything else the string has to be expanded to UTF-16 first so that
+    # an astral code point splits into its surrogate pair before the low
+    # bytes are taken: "\U0001F600" -> units D83D,DE00 -> bytes 3D,00 ->
+    # "PQA=". [::2] picks the low byte of each little-endian unit;
+    # surrogatepass keeps a lone surrogate from raising.
+    try:
+        data = str_.encode("latin-1")
+    except UnicodeEncodeError:
+        data = str_.encode("utf-16-le", "surrogatepass")[::2]
     return base64.b64encode(data).decode("ascii")
 
 
@@ -550,11 +637,36 @@ def fn_base64decode(str_: Any) -> Any:
         return MISSING
     if not isinstance(str_, str):
         return MISSING
-    try:
-        decoded = base64.b64decode(str_, validate=True)
-    except Exception as e:
-        raise RuntimeEvaluationError(None, f"$base64decode: invalid base64 input: {e}") from None
-    return decoded.decode("utf-8", errors="replace")
+    # `Buffer.from(str, 'base64')` (codec.js:20) is LENIENT, and jsonata
+    # inherits that: it never rejects input. Node's decoder
+    #   * treats the first `=` as end-of-data ("QQ==QQ==" -> "A"),
+    #   * silently drops every character outside the base64 alphabet,
+    #     including whitespace, newlines and astral code points
+    #     ("  QQ==  " -> "A", "!!!" -> ""),
+    #   * accepts the URL-safe alphabet interchangeably ("Q-Q_" is
+    #     "Q+Q/"), and
+    #   * decodes a trailing partial group instead of demanding padding:
+    #     4k+2 alphabet chars yield one extra byte ("QQ" -> "A"), 4k+3
+    #     yield two ("QUJ" -> "AB"), and a lone 4k+1 char is discarded
+    #     ("a" -> "").
+    # validate=True rejected all of those, so $base64decode("QQ") raised
+    # where the reference returns "A".
+    data = str_.partition("=")[0]
+    data = _B64_ALIEN.sub("", data)
+    if "-" in data or "_" in data:
+        data = data.translate(_B64_URLSAFE)
+    rem = len(data) & 3
+    if rem == 1:
+        data = data[:-1]
+    elif rem:
+        data += "=" * (4 - rem)
+    # Inverse of fn_base64encode: one UTF-16 code unit per byte with a zero
+    # high byte, i.e. Buffer#toString('binary') / atob (codec.js:20). The
+    # previous utf-8 decode was not the inverse of the encoder at all, so
+    # even $base64decode($base64encode(x)) lost non-ASCII input.
+    # `data` is now provably alphabet-only and correctly padded, so
+    # b64decode cannot raise.
+    return base64.b64decode(data).decode("latin-1")
 
 
 # =============================================================================

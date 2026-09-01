@@ -1,312 +1,194 @@
-"""Converts between long integers and English number words for
-$formatInteger and $parseInteger with pictures "w", "W", "Ww".
+"""Converts between numbers and English number words for the `w`, `W` and
+`Ww` pictures of $formatInteger / $parseInteger.
 
-Ported from org.json_kula.jsonata_jvm.runtime.numeric.EnglishWords.
+Ported from jsonata2js `src/runtime/datetime.js:46-149` (`numberToWords`
+and `wordsToNumber`), which is the reference jsonata implementation.
+
+Two structural properties of the reference are load-bearing here:
+
+  * Words are generated in **Title Case**. That is exactly what the `Ww`
+    picture wants, so `Ww` needs no post-processing at all; `w` lowers
+    and `W` uppers the result (datetime.js:301-307). Deriving title case
+    from a lower-case string (the previous approach) is lossy -- "and"
+    must stay lower-case while "One" must not.
+  * The **sign is not handled here**. `$formatInteger` words the absolute
+    value and prepends '-' itself (datetime.js:289-290, 349-351), so
+    "minus" never appears in the reference's output.
+
+The word separator is likewise the reference's, not "and" everywhere:
+groups of hundreds and magnitudes are joined with ", " while a trailing
+sub-hundred remainder is joined with " and ", so 1970 is "One Thousand,
+Nine Hundred and Seventy".
 """
 
 from __future__ import annotations
 
+import math
 import re
 
-from ...errors import _RuntimeEvaluationError as RuntimeEvaluationError
+_FEW = (
+    "Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+    "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen",
+    "Nineteen",
+)
+_ORDINALS = (
+    "Zeroth", "First", "Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Eighth",
+    "Ninth", "Tenth", "Eleventh", "Twelfth", "Thirteenth", "Fourteenth", "Fifteenth",
+    "Sixteenth", "Seventeenth", "Eighteenth", "Nineteenth",
+)
+_DECADES = ("Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety", "Hundred")
+_MAGNITUDES = ("Thousand", "Million", "Billion", "Trillion")
+_MAG_COUNT = len(_MAGNITUDES)
 
-_ONES = [
-    "", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
-    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
-    "seventeen", "eighteen", "nineteen",
-]
-_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
-_MAGNITUDES = [1_000_000_000_000, 1_000_000_000, 1_000_000, 1_000]
-_MAG_WORDS = ["trillion", "billion", "million", "thousand"]
-
-_WORD_VALUES: dict[str, int] = {}
-for _j, _w in enumerate(
-    [
-        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
-        "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
-        "seventeen", "eighteen", "nineteen",
-    ]
-):
-    _WORD_VALUES[_w] = _j
-for _j, _w in enumerate(["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]):
-    _WORD_VALUES[_w] = (_j + 2) * 10
-_WORD_VALUES["hundred"] = 100
-_WORD_VALUES["thousand"] = 1_000
-_WORD_VALUES["million"] = 1_000_000
-_WORD_VALUES["billion"] = 1_000_000_000
-_WORD_VALUES["trillion"] = 1_000_000_000_000
-_WORD_VALUES["quadrillion"] = 1_000_000_000_000_000
-_WORD_VALUES["quintillion"] = 1_000_000_000_000_000_000
-
-_PARSE_SPLIT = re.compile(r"[\s,\-]+")
-
-_LONG_MAX = 9223372036854775807
-_LONG_MIN = -9223372036854775808
+# 10 ** (mag * 3) for mag 0..4, indexed by the magnitude clamp below.
+_MAG_FACTORS = (1, 1_000, 1_000_000, 1_000_000_000, 1_000_000_000_000)
+_MAG_FACTORS_DOUBLE = (1.0, 1e3, 1e6, 1e9, 1e12)
 
 # =============================================================================
 # Cardinal / ordinal word generation
 # =============================================================================
 
 
-def to_words_double(n: float, ordinal: bool) -> str:
-    """English words for a float that may exceed long range. Trillions are
-    factored out repeatedly until the remainder fits in a (Python) long:
-    e.g. 1e46 -> "ten billion trillion trillion trillion"."""
-    if n < 0:
-        return "minus " + to_words_double(-n, False)
-    if n == 0:
-        return "zeroth" if ordinal else "zero"
-    if n <= _LONG_MAX:
-        return to_words(round(n), ordinal)
-
-    trillion = 1_000_000_000_000.0
-    trillion_count = 0
-    work = n
-    while work >= trillion:
-        work = work / trillion
-        trillion_count += 1
-    base = to_words(round(work), False)
-    return base + " trillion" * max(0, trillion_count)
-
-
 def to_words(n: int, ordinal: bool) -> str:
-    """English cardinal or ordinal words for n."""
-    if n == 0:
-        return "zeroth" if ordinal else "zero"
-    if n < 0:
-        return "minus " + to_words(-n, ordinal)
-    cardinal = _words_below(n)
-    return _to_ordinal_word(n, cardinal) if ordinal else cardinal
+    """English cardinal or ordinal words for a non-negative n, in Title
+    Case. The caller supplies the sign."""
+    return _lookup(n, False, ordinal)
 
 
-def _words_below(n: int) -> str:
-    if n == 0:
-        return ""
-    if n < 20:
-        return _ONES[n]
-    if n < 100:
-        t = _TENS[n // 10]
-        return t if n % 10 == 0 else f"{t}-{_ONES[n % 10]}"
-    if n < 1000:
-        h = f"{_ONES[n // 100]} hundred"
-        rest = n % 100
-        return h if rest == 0 else f"{h} and {_words_below(rest)}"
-    for m, magnitude in enumerate(_MAGNITUDES):
-        if n >= magnitude:
-            hi = n // magnitude
-            rest = n % magnitude
-            s = f"{_words_below(hi)} {_MAG_WORDS[m]}"
-            if rest > 0:
-                return f"{s} and {_words_below(rest)}" if rest < 100 else f"{s}, {_words_below(rest)}"
-            return s
-    return str(n)  # fallback for values above trillion (shouldn't occur within long range)
+def to_words_double(n: float, ordinal: bool) -> str:
+    """English words for a non-negative float beyond long range."""
+    return _lookup_double(n, False, ordinal)
 
 
-_ONES_ORDINAL = {
-    1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth", 6: "sixth",
-    7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth", 11: "eleventh", 12: "twelfth",
-    13: "thirteenth", 14: "fourteenth", 15: "fifteenth", 16: "sixteenth",
-    17: "seventeenth", 18: "eighteenth", 19: "nineteenth",
-}
-_TENS_ORDINAL = {
-    2: "twentieth", 3: "thirtieth", 4: "fortieth", 5: "fiftieth",
-    6: "sixtieth", 7: "seventieth", 8: "eightieth", 9: "ninetieth",
-}
-_ONES_ORD_SUFFIX = {
-    1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth",
-    6: "sixth", 7: "seventh", 8: "eighth", 9: "ninth",
-}
-_TENS_WORD = {
-    2: "twenty", 3: "thirty", 4: "forty", 5: "fifty",
-    6: "sixty", 7: "seventy", 8: "eighty", 9: "ninety",
-}
-_MAG_LIST = ["trillion", "billion", "million", "thousand"]
+def _lookup_double(num: float, prev: bool, ordinal: bool) -> str:
+    """The same `lookup` (datetime.js:64-102) for a value beyond long
+    range, kept in double arithmetic all the way down because the
+    reference's numbers are doubles all the way down.
+
+    Exact integer arithmetic would be wrong here, not merely different:
+    the double spelled 1e46 is really 10000000000000000905969664 x 10^21,
+    so dividing it exactly would produce a sentence about that value,
+    where dividing it as a double gives 1e34 and ultimately "Ten Billion
+    Trillion Trillion Trillion".
+
+    Below a thousand the value is an exact small integer, so the shared
+    integer `_lookup` takes over (and must, since it indexes tuples with
+    the quotients).
+    """
+    if num < 1000.0:
+        return _lookup(int(num), prev, ordinal)
+    mag = int(math.log10(num) / 3)
+    if mag > _MAG_COUNT:
+        mag = _MAG_COUNT
+    factor = _MAG_FACTORS_DOUBLE[mag]
+    # Math.floor of the *rounded* quotient, which is not the same as
+    # Python's float // (an exact floor); the reference divides first.
+    mant = math.floor(num / factor)
+    remainder = num - mant * factor
+    words = (
+        (", " if prev else "")
+        + _lookup_double(float(mant), False, False)
+        + " "
+        + _MAGNITUDES[mag - 1]
+    )
+    if remainder > 0:
+        return words + _lookup_double(remainder, True, ordinal)
+    return words + "th" if ordinal else words
 
 
-def _to_ordinal_word(n: int, cardinal: str) -> str:
-    if n < 20:
-        return _ONES_ORDINAL.get(n, cardinal)
-    if n < 100:
-        if n % 10 == 0:
-            return _TENS_ORDINAL.get(n // 10, cardinal)
-        ones_digit = n % 10
-        tens_digit = n // 10
-        ones_ord = _ONES_ORD_SUFFIX.get(ones_digit, "")
-        tens_word = _TENS_WORD.get(tens_digit, "")
-        return f"{tens_word}-{ones_ord}"
-    # n >= 100: append ordinal suffix to the last magnitude name.
-    if n % 100 == 0:
-        for mag in _MAG_LIST:
-            if cardinal.endswith(mag):
-                return cardinal[: -len(mag)] + mag + "th"
-        # Falls through to "hundredth"
-        return cardinal.replace("hundred", "hundredth")
-    # Non-round: convert the last 1-99 to ordinal, prefix with the main part.
-    last_part = n % 100
-    if last_part > 0:
-        last_ordinal = _to_ordinal_word(last_part, "")
-        main_part = _words_below(n - last_part)
-        return f"{main_part} and {last_ordinal}"
-    return cardinal + "th"
+def _lookup(num: int, prev: bool, ordinal: bool) -> str:
+    """Port of the `lookup` closure at datetime.js:64-102.
 
-
-# =============================================================================
-# Title-case
-# =============================================================================
-
-
-def title_case(s: str) -> str:
-    """Applies title-case to an English number-word string, keeping "and"
-    lowercase."""
-    if not s:
-        return s
-    out: list[str] = []
-    cap_next = True
-    i = 0
-    n = len(s)
-    while i < n:
-        c = s[i]
-        if c in (" ", ",", "-"):
-            out.append(c)
-            cap_next = True
-        elif cap_next:
-            if s[i : i + 4].lower() == "and ":
-                out.append("a")
-            else:
-                out.append(c.upper())
-            cap_next = False
-        else:
-            out.append(c)
-        i += 1
-    return "".join(out)
+    `prev` says a more significant group has already been emitted, which
+    selects the joining separator: " and " before a sub-hundred group,
+    ", " before a hundreds or magnitude group.
+    """
+    if num <= 19:
+        return (" and " if prev else "") + (_ORDINALS[num] if ordinal else _FEW[num])
+    if num < 100:
+        tens, remainder = divmod(num, 10)
+        words = (" and " if prev else "") + _DECADES[tens - 2]
+        if remainder > 0:
+            return words + "-" + _lookup(remainder, False, ordinal)
+        if ordinal:
+            # "Twenty" -> "Twent" + "ieth"
+            return words[:-1] + "ieth"
+        return words
+    if num < 1000:
+        hundreds, remainder = divmod(num, 100)
+        words = (", " if prev else "") + _FEW[hundreds] + " Hundred"
+        if remainder > 0:
+            return words + _lookup(remainder, True, ordinal)
+        return words + "th" if ordinal else words
+    # floor(log10(num) / 3) without the libm round-trip: for a positive
+    # integer, floor(log10(num)) is len(str(num)) - 1, and adding the
+    # discarded fraction back can never cross a multiple of 3.
+    mag = (len(str(num)) - 1) // 3
+    if mag > _MAG_COUNT:
+        mag = _MAG_COUNT
+    factor = _MAG_FACTORS[mag]
+    mant, remainder = divmod(num, factor)
+    words = (", " if prev else "") + _lookup(mant, False, False) + " " + _MAGNITUDES[mag - 1]
+    if remainder > 0:
+        return words + _lookup(remainder, True, ordinal)
+    return words + "th" if ordinal else words
 
 
 # =============================================================================
-# Parsing English words -> long
+# Parsing English words -> number
 # =============================================================================
+
+_NAN = math.nan
+
+# datetime.js:133 -- ", " / " and " / any single whitespace, backslash or hyphen.
+_PARSE_SPLIT = re.compile(r",\s|\sand\s|[\s\\-]")
+
+# datetime.js:107-125. Ordinal spellings are folded in alongside the
+# cardinals, which is why $parseInteger needs no separate ordinal-suffix
+# stripping for word pictures: "twelfth" and "twentieth" are keys.
+_WORD_VALUES: dict[str, float] = {}
+for _i, _w in enumerate(_FEW):
+    _WORD_VALUES[_w.lower()] = _i
+for _i, _w in enumerate(_ORDINALS):
+    _WORD_VALUES[_w.lower()] = _i
+for _i, _w in enumerate(_DECADES):
+    _lw = _w.lower()
+    _WORD_VALUES[_lw] = (_i + 2) * 10
+    _WORD_VALUES[_lw[:-1] + "ieth"] = (_i + 2) * 10
+_WORD_VALUES["hundredth"] = 100
+for _i, _w in enumerate(_MAGNITUDES):
+    _lw = _w.lower()
+    # Float, as the reference's Math.pow is: it keeps "ten billion
+    # trillion trillion trillion" at the double 1e46 rather than an exact
+    # (and therefore unequal) Python bignum.
+    _v = float(10 ** ((_i + 1) * 3))
+    _WORD_VALUES[_lw] = _v
+    _WORD_VALUES[_lw + "th"] = _v
+del _i, _w, _lw, _v
 
 
 def parse_words(s: str) -> int | float:
-    """Standard stacking algorithm: units accumulate in a sub-total, which
-    is multiplied into the running total whenever a magnitude word
-    (thousand, million, ...) is encountered. Handles "one million one
-    thousand" -> 1,001,000 (each magnitude group independent)."""
-    tokens = _PARSE_SPLIT.split(s.lower().strip())
-    negative = False
-    total = 0
-    subtotal = 0
-    last_magnitude = 0  # tracks last committed magnitude to detect ascending order
+    """Port of `wordsToNumber` (datetime.js:132-149): a stack of segment
+    totals, where a word below 100 accumulates into the top segment and a
+    magnitude word multiplies it.
 
-    for tok in tokens:
-        if not tok or tok == "and":
-            continue
-        if tok == "minus":
-            negative = True
-            continue
-
-        val = _WORD_VALUES.get(tok)
-        if val is None:
-            raise RuntimeEvaluationError(None, f'$parseInteger: unrecognised word token "{tok}"')
-
-        if val == 100:
-            # "hundred" multiplies the current sub-total (or implies 1).
-            subtotal = (subtotal if subtotal != 0 else 1) * 100
-        elif val >= 1_000:
-            # >= (not strictly >, despite the Java source's literal `>`):
-            # verified against the official suite -- "ten billion trillion
-            # trillion trillion" (repeated identical magnitude words, the
-            # exact inverse of to_words_double's "divide by 1e12 three
-            # times, append trillion three times" encoding) must keep
-            # ascending/multiplying on each repeat, not fall back to
-            # descending/additive once val==last_magnitude.
-            if last_magnitude > 0 and val >= last_magnitude:
-                # Ascending magnitude: "one thousand trillion" -> 1000 x 10^12.
-                base = total + subtotal
-                total = (base if base != 0 else 1) * val
-            else:
-                # Descending or first: "one million one thousand" -> 10^6 + 1x10^3.
-                contribution = (subtotal if subtotal != 0 else 1) * val
-                total = total + contribution
-            # Deliberately no range clamp here (unlike the Java source's
-            # long-overflow guard): Python ints are arbitrary precision, so
-            # we let magnitude words keep compounding exactly (e.g. three
-            # consecutive "trillion" tokens -> 1e10*1e12*1e12*1e12) and only
-            # decide int-vs-float range at the very end. Clamping mid-loop
-            # would silently drop later tokens.
-            subtotal = 0
-            last_magnitude = val
+    An unrecognised word is `undefined` in the reference and poisons the
+    arithmetic to NaN; NaN here reproduces that (it compares false against
+    both 100 and 1000 exactly as `undefined` does).
+    """
+    segs: list[float] = [0]
+    get = _WORD_VALUES.get
+    for part in _PARSE_SPLIT.split(s):
+        value = get(part, _NAN)
+        if value < 100:
+            top = segs.pop()
+            if top >= 1000:
+                segs.append(top)
+                top = 0
+            segs.append(top + value)
         else:
-            subtotal += val
-    total += subtotal
-    result = -total if negative else total
-    if not (_LONG_MIN <= result <= _LONG_MAX):
-        # Out of long range: surface as a float (JS double semantics),
-        # matching the JSON test-suite expectation (e.g. 1e+46) rather
-        # than an unbounded exact Python int.
-        return float(result)
-    return result
-
-
-# =============================================================================
-# Ordinal suffix stripping (for $parseInteger with ";o" modifier)
-# =============================================================================
-
-_IRREGULAR_ORDINALS = {
-    "twelfth": "twelve",
-    "fifth": "five",
-    "ninth": "nine",
-    "first": "one",
-    "second": "two",
-    "third": "three",
-}
-
-
-def strip_ordinal_suffix(s: str) -> str:
-    """Strips the ordinal suffix from a word-form ordinal string."""
-    lower = s.lower().strip()
-    last_space = lower.rfind(" ")
-    last_word = lower[last_space + 1 :] if last_space >= 0 else lower
-
-    if last_word in _IRREGULAR_ORDINALS:
-        return _replace_last_word(lower, last_space, _IRREGULAR_ORDINALS[last_word])
-
-    # "twentieth" -> "twenty", "thirtieth" -> "thirty", etc.
-    if lower.endswith("ieth"):
-        return lower[:-4] + "y"
-
-    # Hyphenated: "thirty-fourth" -> last part after "-" has ordinal suffix
-    if "-" in lower:
-        parts = lower.split("-")
-        last_part = parts[-1]
-        if last_part.endswith(("st", "nd", "rd", "th")):
-            root = last_part[:-2]
-            cardinal = _ordinal_root_to_cardinal(root)
-            result = " ".join(parts[:-1])
-            if result:
-                result += " "
-            result += cardinal
-            return result
-
-    # Standard suffix stripping
-    if lower.endswith(("st", "nd", "rd", "th")):
-        return _ordinal_root_to_cardinal(lower[:-2])
-    return s
-
-
-def _replace_last_word(full: str, last_space: int, replacement: str) -> str:
-    return full[: last_space + 1] + replacement if last_space >= 0 else replacement
-
-
-_ORDINAL_ROOT_TO_CARDINAL = {
-    "nin": "nine",
-    "fif": "five",
-    "twelf": "twelve",
-    "thi": "three",
-    "fir": "one",
-    "seco": "two",
-    "secon": "two",
-}
-
-
-def _ordinal_root_to_cardinal(root: str) -> str:
-    return _ORDINAL_ROOT_TO_CARDINAL.get(root, root)
+            segs.append(segs.pop() * value)
+    total: float = 0
+    for seg in segs:
+        total += seg
+    return total

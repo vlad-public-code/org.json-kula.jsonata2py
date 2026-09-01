@@ -83,6 +83,32 @@ def test_regex_literal_cache_stays_bounded() -> None:
     assert len(regex_ops._CACHE) <= regex_ops._REGEX_CACHE_LIMIT
 
 
+def test_over_long_regex_literal_is_not_cached() -> None:
+    """The cache is keyed on the pattern text, and a pattern can come out of
+    an input document, so the KEY length is attacker controlled: bounding the
+    entry count alone still lets 512 huge patterns pin unbounded memory. An
+    over-long pattern is compiled and used, but never retained."""
+    before = len(regex_ops._CACHE)
+    filler = "a" * (regex_ops._MAX_CACHEABLE_PATTERN + 1)
+    for i in range(32):
+        expr = _FACTORY.compile(f'$match("{filler}{i}", /{filler}{i}/)')
+        assert expr.evaluate({})["match"] == f"{filler}{i}"
+    assert len(regex_ops._CACHE) == before
+
+
+def test_over_long_regex_literal_behaves_identically_to_a_cached_one() -> None:
+    """Only the caching changes at the limit -- never the semantics. The
+    dialect rewrites (`.`, `^`/`$` under /m) must fire either side of it."""
+    short = "a.b$"
+    long = "a" * regex_ops._MAX_CACHEABLE_PATTERN + "|a.b$"
+    assert len(short) <= regex_ops._MAX_CACHEABLE_PATTERN < len(long)
+    for pattern in (short, long):
+        assert _FACTORY.compile(f'$contains("a.b", /{pattern}/)').evaluate({}) is True
+        assert _FACTORY.compile(f'$contains("axb\\n", /{pattern}/)').evaluate({}) is False
+        assert _FACTORY.compile(f'$contains("axb\\n", /{pattern}/m)').evaluate({}) is True
+        assert _FACTORY.compile(f'$contains("a\\rb", /{pattern}/)').evaluate({}) is False
+
+
 def test_regex_still_works_after_its_cache_evicts() -> None:
     for i in range(regex_ops._REGEX_CACHE_LIMIT * 2):
         _FACTORY.compile(f'$match("b{i}", /b{i}/)').evaluate({})

@@ -23,6 +23,8 @@ Usage:
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ..errors import ParseError
 from .ast_nodes import (
     ArrayConstructor,
@@ -85,7 +87,7 @@ BUILTIN_NAMES: frozenset[str] = frozenset(
         "formatBase", "formatInteger", "parseInteger", "now", "millis",
         "fromMillis", "toMillis", "error", "assert", "typeOf", "eval",
         "encodeUrl", "encodeUrlComponent", "decodeUrl", "decodeUrlComponent",
-        "base64encode", "base64decode",
+        "base64encode", "base64decode", "clone",
     }
 )
 
@@ -148,6 +150,10 @@ class Parser:
         self.transform_pattern_depth = 0
         # Counter for generating unique temp variable names in lambda desugaring.
         self.lambda_temp_counter = 0
+        # One-shot: set by _parse_dot_step around the step's primary so a
+        # bare `name(...)` there parses as a field call rather than the
+        # eager T1005 a top-level bare built-in call still gets.
+        self._dot_step_pending = False
 
     @staticmethod
     def parse(expression: str) -> AstNode:
@@ -349,6 +355,28 @@ class Parser:
     # Postfix helpers
     # =========================================================================
 
+    @staticmethod
+    def _as_path_head(node: AstNode) -> AstNode:
+        """Rewrites a bare quoted string heading a path into the field
+        reference it denotes.
+
+        `"a.b".c` selects the field literally named `a.b`, while `("a.b").c`
+        selects field `c` of the string value "a.b" -- the parenthesised form
+        is a value, and yields nothing. Only the parser can tell them apart:
+        it still holds the `Parenthesized` wrapper that the optimizer folds
+        away, so the distinction is resolved here rather than at codegen.
+
+        Subscripts and predicates sit between the name and the dot without
+        changing what the head denotes: `"a"[0].b` still reads field `a`.
+        """
+        if isinstance(node, StringLiteral):
+            return FieldRef(node.value)
+        if isinstance(node, (PredicateExpr, ArraySubscript, ForceArray, SortExpr, GroupByExpr)):
+            head = Parser._as_path_head(node.source)
+            if head is not node.source:
+                return replace(node, source=head)
+        return node
+
     def _parse_dot_step(self, left: AstNode) -> AstNode:
         self._consume(TokenType.DOT)
         # % after a dot means "parent step"
@@ -368,9 +396,18 @@ class Parser:
                 t.position,
             )
         else:
-            right = self._parse_primary()
+            # A bare `name(...)` here is a call on a FIELD of the step
+            # context, not a built-in -- `$o.count()` invokes $o's own
+            # `count` field. The flag is one-shot and consumed by
+            # _parse_identifier_or_function_call, so a nested expression
+            # inside the step's arguments does not inherit it.
+            self._dot_step_pending = True
+            try:
+                right = self._parse_primary()
+            finally:
+                self._dot_step_pending = False
         # Flatten consecutive dot-steps into a single PathExpr
-        steps: list[AstNode] = list(left.steps) if isinstance(left, PathExpr) else [left]
+        steps: list[AstNode] = list(left.steps) if isinstance(left, PathExpr) else [self._as_path_head(left)]
         steps.append(right)
         return PathExpr(steps)
 
@@ -576,6 +613,8 @@ class Parser:
                 return self._desugar_immediate_lambda_call(lambda_node)
             return lambda_node
         if self._peek().type == TokenType.LPAREN:
+            in_dot_step = self._dot_step_pending
+            self._dot_step_pending = False
             call = self._parse_function_args(t.value, t.position)
             if isinstance(call, PartialApplication):
                 # Bare identifier partial application is invalid.
@@ -585,6 +624,10 @@ class Parser:
                         "T1007", f"Attempted to partially apply a built-in function '{t.value}'", t.position
                     )
                 raise ParseError("T1008", "The expression is not a function", t.position)
+            if in_dot_step and isinstance(call, FunctionCall):
+                # Resolved against the step context at run time, so a
+                # built-in's name is just an ordinary field name here.
+                return FunctionCall(call.name, call.args, is_variable=False)
             # Regular call of a built-in function without $ prefix - raise T1005
             if t.value in BUILTIN_NAMES:
                 raise ParseError(

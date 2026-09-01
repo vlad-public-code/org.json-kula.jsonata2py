@@ -58,10 +58,11 @@ from ..parser.ast_nodes import (
     RangeExpr,
     RootRef,
     SortExpr,
-    StringLiteral,
     WildcardStep,
     accept,
 )
+from ..parser.parser import BUILTIN_NAMES
+from .gen_state import emit_callback
 from .naming import py_string, pyvar
 
 if TYPE_CHECKING:
@@ -325,11 +326,12 @@ def _step_expr(t: Translator, step: AstNode, ctx: GenCtx) -> str:
     ctx.ctx_var)."""
     if isinstance(step, FieldRef):
         return f"field({ctx.ctx_var}, {py_string(step.name)})"
-    if isinstance(step, StringLiteral):
-        # A quoted string as the leading path step is a field reference.
-        return f"field({ctx.ctx_var}, {py_string(step.value)})"
     if isinstance(step, WildcardStep):
-        return f"wildcard({ctx.ctx_var})"
+        # A leading `*` enumerates the context node itself only while that
+        # node is the evaluation's top-level input, which the reference
+        # alone marks as the outer wrapper. Below it the path context is an
+        # ordinary element and the step applies per element.
+        return f"wildcard_context({ctx.ctx_var})" if ctx.at_input_root else f"wildcard({ctx.ctx_var})"
     if isinstance(step, DescendantStep):
         return f"descendant({ctx.ctx_var})"
     if isinstance(step, ContextRef):
@@ -344,6 +346,17 @@ def apply_step(t: Translator, prev_expr: str, step: AstNode, ctx: GenCtx) -> str
     a path)."""
     if isinstance(step, FieldRef):
         return f"field({prev_expr}, {py_string(step.name)})"
+    if isinstance(step, FunctionCall) and not step.is_variable:
+        # `a.g(...)`: the callee is a FIELD of the step context, not a
+        # variable and not a built-in, so it resolves per element and
+        # maps over a sequence like any other step ($o.g() over a
+        # 2-element $o yields two results).
+        elem = f"_fc{ctx.state.next_id()}"
+        inner = ctx.with_ctx(elem)
+        args = [accept(a, t, inner) for a in step.args]
+        packed = "None" if not args else (args[0] if len(args) == 1 else f"pack_args({', '.join(args)})")
+        callee = f"field_function({elem}, {py_string(step.name)}, {step.name in BUILTIN_NAMES})"
+        return f"call_field_step({prev_expr}, lambda {elem}: fn_apply({callee}, {packed}))"
     if isinstance(step, WildcardStep):
         return f"wildcard({prev_expr})"
     if isinstance(step, DescendantStep):
@@ -357,18 +370,23 @@ def apply_step(t: Translator, prev_expr: str, step: AstNode, ctx: GenCtx) -> str
             from_expr = accept(step.predicate.from_, t, ctx)
             to_expr = accept(step.predicate.to, t, ctx)
             return f"range_subscript({prev_expr}, {from_expr}, {to_expr})"
-        elem_var = f"_el{ctx.state.next_id()}"
-        pred_expr = accept(step.predicate, t, ctx.with_ctx(elem_var))
-        return f"dynamic_filter({prev_expr}, lambda {elem_var}: {pred_expr})"
+        pred = step.predicate
+        cb = emit_callback(pred, ctx, "_el", lambda v: accept(pred, t, ctx.with_ctx(v)))
+        return f"dynamic_filter({prev_expr}, {cb})"
     if isinstance(step, ArraySubscript):
-        tmp_ctx = f"_c{ctx.state.next_id()}"
-        src_expr = accept(step.source, t, ctx.with_ctx(tmp_ctx))
-        idx_expr = accept(step.index, t, ctx.with_ctx(tmp_ctx))
-        return f"map_step({prev_expr}, lambda {tmp_ctx}: subscript({src_expr}, {idx_expr}))"
+        sub: ArraySubscript = step
+
+        def build_subscript(v: str) -> str:
+            inner = ctx.with_ctx(v)
+            return f"subscript({accept(sub.source, t, inner)}, {accept(sub.index, t, inner)})"
+
+        return f"map_step({prev_expr}, {emit_callback(sub, ctx, '_c', build_subscript)})"
     if isinstance(step, ArrayConstructor):
-        tmp_ctx = f"_c{ctx.state.next_id()}"
-        step_expr = accept(step, t, ctx.with_ctx(tmp_ctx).with_in_array_constructor_step())
-        call = f"map_constructor_step({prev_expr}, lambda {tmp_ctx}: {step_expr})"
+        arr: ArrayConstructor = step
+        cb = emit_callback(
+            arr, ctx, "_c", lambda v: accept(arr, t, ctx.with_ctx(v).with_in_array_constructor_step())
+        )
+        call = f"map_constructor_step({prev_expr}, {cb})"
         return call if ctx.array_constructor_preserve else f"unwrap({call})"
     if isinstance(step, ObjectConstructor):
         if ctx.tuple_pos is not None:
@@ -389,22 +407,28 @@ def apply_step(t: Translator, prev_expr: str, step: AstNode, ctx: GenCtx) -> str
             finally:
                 ctx.state.pop_scope()
             return f"unwrap(map_constructor_step({prev_expr}, lambda {tmp_tuple}: {step_expr}))"
-        tmp_ctx = f"_c{ctx.state.next_id()}"
-        step_expr = accept(step, t, ctx.with_ctx(tmp_ctx))
-        return f"unwrap(map_constructor_step({prev_expr}, lambda {tmp_ctx}: {step_expr}))"
+        obj: ObjectConstructor = step
+        cb = emit_callback(obj, ctx, "_c", lambda v: accept(obj, t, ctx.with_ctx(v)))
+        return f"unwrap(map_constructor_step({prev_expr}, {cb}))"
     if isinstance(step, GroupByExpr) and isinstance(step.source, ContextRef):
         # GroupByExpr(ContextRef) appears as a path step only after Rule D's
         # binding rewrite. It must receive the whole accumulated sequence,
         # not be applied per-element.
         return accept(step, t, ctx.with_ctx(prev_expr))
     # Default: rebind the context to prev_expr inside a mapped lambda.
-    tmp_ctx = f"_c{ctx.state.next_id()}"
-    if ctx.state.contains_parent_step(step) and not ctx.parent_vars:
-        inner_ctx = ctx.with_ctx(tmp_ctx).with_parents([ctx.ctx_var])
-    else:
-        inner_ctx = ctx.with_ctx(tmp_ctx)
-    step_expr = accept(step, t, inner_ctx)
-    return f"map_step({prev_expr}, lambda {tmp_ctx}: {step_expr})"
+    # A `%` inside the step with no parent available yet makes the *outer*
+    # context the parent -- an evaluator-scope local, so such a step never
+    # hoists (ParentStep is off the whitelist, which is what enforces it).
+    outer_parent = ctx.ctx_var if (ctx.state.contains_parent_step(step) and not ctx.parent_vars) else None
+    tail: AstNode = step
+
+    def build_step(v: str) -> str:
+        inner = ctx.with_ctx(v)
+        if outer_parent is not None:
+            inner = inner.with_parents([outer_parent])
+        return accept(tail, t, inner)
+
+    return f"map_step({prev_expr}, {emit_callback(tail, ctx, '_c', build_step)})"
 
 
 _STATIC_BOOLEAN_OPS = {"=", "!=", "<", ">", "<=", ">=", "in", "and", "or"}
@@ -474,10 +498,10 @@ def visit_predicate_expr(t: Translator, n: PredicateExpr, ctx: GenCtx) -> str:
             return f"force_array({result})" if force_arr else result
 
     src_expr = accept(source_node, t, ctx)
-    elem_var = f"_el{ctx.state.next_id()}"
-    pred_expr = accept(n.predicate, t, ctx.with_ctx(elem_var))
-    filter_fn = "filter_" if _is_static_boolean_predicate(n.predicate) else "dynamic_filter"
-    r = f"{filter_fn}({src_expr}, lambda {elem_var}: {pred_expr})"
+    pred = n.predicate
+    cb = emit_callback(pred, ctx, "_el", lambda v: accept(pred, t, ctx.with_ctx(v)))
+    filter_fn = "filter_" if _is_static_boolean_predicate(pred) else "dynamic_filter"
+    r = f"{filter_fn}({src_expr}, {cb})"
     return f"force_array({r})" if force_arr else r
 
 
