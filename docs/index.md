@@ -10,6 +10,10 @@ Port of [jsonata-jvm-compiler](https://vlad-public-code.github.io/org.json-kula.
 
 All 1,281 files of the [official JSONata test suite](https://github.com/jsonata-js/jsonata/blob/master/test/test-suite/TESTSUITE.md) pass.
 
+Evaluation is **~47x faster than the pure-Python reference interpreter**, and
+~2x-4x faster than both Rust-backed alternatives on this benchmark — including on
+JSON text in, JSON text out ([see the benchmarks](#performance)).
+
 ---
 
 ## Requirements
@@ -484,76 +488,106 @@ arithmetic and a conditional.
 | | jsonata2py | [`jsonatapy`](https://pypi.org/project/jsonatapy/) | [`jsonata-rs`](https://pypi.org/project/jsonata-rs/) | [`jsonata-python`](https://pypi.org/project/jsonata-python/) |
 |---|---|---|---|---|
 | Implementation | translator, pure Python | native, Rust/PyO3 | native, Rust/PyO3 | interpreter, pure Python |
-| **Evaluation** (`dict`→`dict`) | **214 µs** | 257 µs | 517 µs | 5 471 µs |
-| Relative | **baseline** | 1.20x slower | 2.42x slower | 25.6x slower |
-| Throughput | **4 677/s** | 3 889/s | 1 934/s | 183/s |
-| Cold compilation | 6.92 ms | **0.26 ms** | 1.11 ms | 7.31 ms |
+| **Evaluation** (`dict`→`dict`) | **123 µs** | 250 µs | 517 µs † | 5 740 µs |
+| Relative | **baseline** | 2.03x slower | 4.20x slower † | 46.7x slower |
+| Throughput | **8 130/s** | 4 000/s | 1 934/s † | 174/s |
+| Cold compilation | 6.49 ms | **0.25 ms** | 1.11 ms † | 8.24 ms |
 | Wheels on PyPI | pure Python (any platform) | 16, incl. Windows | 5 — **no Windows wheel** | pure Python (any platform) |
 
-Versions measured: jsonata2py 0.1.0, jsonatapy 2.2.7, jsonata-rs 0.1.4,
+Versions measured: jsonata2py 0.1.1, jsonatapy 2.2.7, jsonata-rs 0.1.4,
 jsonata-python 0.7.0 — each the latest release on PyPI when these numbers were
-taken (re-measured 2026-08-24).
+taken (evaluation re-measured 2026-09-01, after the conformance fixes for
+`$spread`, nested wildcard paths, and builtin context substitution in version 0.1.1).
 
-### Why a pure-Python library beats two Rust ones here
+† `jsonata-rs` and `jsonata-python` both install a top-level module named
+`jsonata` and therefore cannot coexist in one environment, so the `jsonata-rs`
+column (here and in the tables below) is carried over from the 2026-08-24 session
+on the same machine, with its relative figures recomputed against the current
+jsonata2py number. The other three columns were measured in a single run, with
+all three outputs asserted identical first.
+
+### Why a pure-Python library beats two native ones here
 
 This is the part worth understanding before you trust the table, because
 "pure Python beats Rust" is not a claim that should be taken at face value.
 
-A native extension has to move your data across the FFI boundary. Every
-`evaluate()` call converts the input `dict` into the extension's own value
-representation and converts the result back. That cost scales with the size of the
-data, not the complexity of the expression. jsonata2py generates Python code that
-reads *the objects you already have* — it converts nothing.
+Two separate effects stack up, and it is worth keeping them apart.
 
-So the native libraries pay a per-call tax that jsonata2py does not, and on
-documents of this size that tax exceeds their raw evaluation advantage. Three
-independent observations confirm the mechanism rather than assuming it:
+**The compiled Python code is genuinely fast.** Translation removes per-node
+visitor dispatch, per-element callback frames and repeated type re-checking —
+see [Where the speed comes from](#where-the-speed-comes-from). In CPython a
+function call costs ~85 ns and cannot be inlined away, so a tree-walking
+interpreter's per-node overhead is irreducible, while generated straight-line
+code simply does not pay it.
 
-1. **Give `jsonatapy` a path that avoids the boundary and it wins.** Its native
-   `evaluate_json()` takes JSON text and returns JSON text, never materialising a
-   Python object graph: 254 µs versus jsonata2py's 270 µs for the same
-   text-in/text-out work. Exactly the reversal the explanation predicts.
-2. **Shrink the expression and the advantage inverts.** On a trivial
-   `$sum(items.value)`, jsonatapy is ~1.15-1.3x *faster* than jsonata2py — there is
-   barely any evaluation work for jsonata2py's compiled code to win back.
-3. **Grow the document and the advantage erodes.** Marshalling cost rises with
-   document size until it cancels the native speed advantage entirely:
+**On top of that, a native extension has to move your data across the FFI
+boundary.** Every `evaluate()` call converts the input `dict` into the
+extension's own value representation and converts the result back. That cost
+scales with the size of the *data*, not the complexity of the expression.
+jsonata2py generates Python code that reads *the objects you already have* — it
+converts nothing.
 
-   | `$sum(items.value)` | n=10 | n=100 | n=1 000 | n=10 000 |
-   |---|---|---|---|---|
-   | jsonata2py | 2.9 µs | 20.4 µs | 195 µs | 1 989 µs |
-   | jsonatapy | 2.5 µs | 16.3 µs | 151 µs | 2 133 µs |
-   | jsonata-rs | 6.0 µs | 41.0 µs | 373 µs | 4 753 µs |
-   | jsonata-python | 67.2 µs | 461 µs | 4 322 µs | 42 115 µs |
+The second effect is why the margin *widens* with document size. On
+`$sum(items.value)`, a deliberately trivial expression that gives the compiled
+code almost nothing to win back:
 
-The honest summary: **jsonata2py is fastest when a non-trivial expression runs
-against Python objects you already hold.** That is the common case for a JSONata
-library embedded in a Python service, which is why it leads the first table. It is
-not a general claim to be faster than Rust.
+| `$sum(items.value)` | n=10 | n=100 | n=1 000 | n=10 000 |
+|---|---|---|---|---|
+| jsonata2py | 1.9 µs | 9.5 µs | 85 µs | 848 µs |
+| jsonatapy | 2.4 µs | 16.2 µs | 155 µs | 2 141 µs |
+| jsonata-rs † | 6.0 µs | 41.0 µs | 373 µs | 4 753 µs |
+| jsonata-python | 65.8 µs | 439 µs | 4 222 µs | 42 501 µs |
+
+jsonata2py leads at every size, and its lead over `jsonatapy` grows from 1.27x
+at n=10 to 2.53x at n=10 000 — the marshalling tax becoming visible as the
+document grows.
+
+**Two claims that earlier versions of this section made are no longer true**,
+and are recorded here because they were the section's own supporting evidence:
+
+- It used to say that giving `jsonatapy` a path that avoids the boundary lets it
+  win. It no longer does. `evaluate_json()` takes JSON text and returns JSON
+  text, never materialising a Python object graph, and that is the comparison
+  most favourable to it — yet jsonata2py doing `json.loads` → `evaluate` →
+  `json.dumps` is **183 µs against its 255 µs**, still 1.39x ahead.
+- It used to say that on a trivial expression `jsonatapy` is ~1.15-1.3x
+  *faster*, because there is barely any evaluation work to win back. The table
+  above is that same measurement, and the ordering has inverted at every size.
+
+Both reversals come from the same place: the optimization pass in
+`docs/design/PERFORMANCE-REVIEW.md` review #3, which cut evaluation on the main
+benchmark by 1.9x and `$sum(x.field)` specifically by 2.3x.
+
+The honest summary is still narrower than "faster than Rust": **jsonata2py is
+fastest when you evaluate a compiled expression against Python objects you
+already hold**, which is the common case for a JSONata library embedded in a
+Python service. Where a native library can still win is a workload that
+compiles constantly and evaluates rarely — its compile step is 27x cheaper, so
+see the break-even below.
 
 ### When compilation pays for itself
 
 Compilation is a one-time cost; evaluation is what repeats. Dividing the extra
 compile time by the per-evaluation saving gives the break-even point on this
-workload:
+workload — every figure below is derived from the table above, so it moves with it:
 
 | Compared with | Extra compile cost | Saved per evaluation | Break-even |
 |---|---|---|---|
-| `jsonatapy` | +6.66 ms | 43 µs | **~154 evaluations** |
-| `jsonata-rs` | +5.81 ms | 303 µs | **~19 evaluations** |
-| `jsonata-python` | *none* — 0.4 ms cheaper | 5 257 µs | **immediately** |
+| `jsonatapy` | +6.24 ms | 127 µs | **~49 evaluations** |
+| `jsonata-rs` † | +5.38 ms | 394 µs | **~14 evaluations** |
+| `jsonata-python` | *none* — 1.75 ms cheaper | 5 617 µs | **immediately** |
 
 Compile once at startup, evaluate on the hot path, and the compilation cost stops
-mattering after the first few hundred calls at worst. Compile inside a request
-handler and you pay it every time — see the guidance below.
+mattering after a few dozen calls. Compile inside a request handler and you pay it
+every time — see the guidance below.
 
 ### Repeat compilation of the same text
 
 Compiling *the same expression text* again is far cheaper than the table suggests,
 in two tiers. While an earlier `CompiledExpression` for that text is still
-reachable, a repeat `compile()` reuses its entry point and costs **~1 µs**. Once
+reachable, a repeat `compile()` reuses its entry point and costs **~0.9 µs**. Once
 that has been collected, the factory still holds the compiled *code object*, and
-re-executing it into a fresh module namespace costs **~15 µs** rather than
+re-executing it into a fresh module namespace costs **~20 µs** rather than
 re-running the whole pipeline — the case a long-lived process actually hits when it
 compiles an expression, uses it, drops it, and meets the same text again later.
 
@@ -569,18 +603,40 @@ cache has never seen, or has already evicted, still pays full price.
 
 ### Where the speed comes from
 
-Per-node visitor dispatch and type-check chains disappear at compile time; a JSONata
-variable becomes a Python local; a built-in call resolves directly to the runtime
-function the translator already chose, with no re-dispatch; `and`/`or` are emitted
-as Python's own short-circuiting operators rather than helper calls taking a closure
-per operand; sorting uses a native key-sort instead of a comparator callback wrapped
-in `functools.cmp_to_key`; and fused aggregate paths (`$count(x[field = "value"])`,
-`$sum(x.field)`) run as a single loop with no intermediate list.
+Compile-time work that a tree-walking interpreter repeats on every evaluation:
+per-node visitor dispatch and type-check chains disappear; a JSONata variable
+becomes a Python local; a built-in call resolves directly to the runtime function
+the translator already chose, with no re-dispatch; `and`/`or` are emitted as
+Python's own short-circuiting operators rather than helper calls taking a closure
+per operand; sorting uses a native key-sort instead of a comparator callback
+wrapped in `functools.cmp_to_key`; and fused aggregate paths
+(`$count(x[field = "value"])`, `$sum(x.field)`) run as a single loop with no
+intermediate list.
 
-The Java sibling's headline — ~40x over JSONata4Java — does **not** carry over.
-That number comes from JIT-compiled bytecode replacing an AST interpreter, and
-CPython has no JIT: generated Python source runs on the same interpreter an AST
-walker would. What compilation still removes is the per-node overhead listed above.
+Runtime work that review #3 removed, all of it in the same spirit — **CPython
+cannot inline a small function, so the fix is to not call one**:
+
+- Fused aggregate and count helpers are monomorphized per value kind, so a
+  per-element comparison is a branch in one loop rather than a closure reached
+  through a helper. `sum(1 for ...)` became a plain `for`, because PEP 709 inlines
+  comprehensions but *not* generator expressions — a genexpr costs a frame resume
+  per element.
+- `eq`/`ne` settle scalar comparisons inline instead of delegating to the
+  recursive deep-equality walk, whose own first act was the same type test.
+- `$distinct` deduplicates scalars through a set per JSONata kind and buckets
+  composites by a structural hash, replacing a pairwise scan that was O(n²).
+- The delegating built-ins in `core.py` no longer re-execute an `import`
+  statement on every call, and the timeout guard no longer does a `ContextVar`
+  lookup per callback-taking helper.
+
+**On the comparison with the Java sibling.** Its headline is ~40x over
+JSONata4Java and this port now measures ~47x over `jsonata-python`, but those
+ratios are not comparable: each divides by a different interpreter, and
+`jsonata-python` is the slower baseline of the two. The Java number comes from
+JIT-compiled bytecode replacing an AST walker; CPython has no JIT, so generated
+Python source runs on the very same interpreter an AST walker would. The win here
+is entirely the removal of per-node and per-element overhead listed above — which
+turns out to be worth about as much, proportionally, as the JVM's machine code.
 
 Unlike the Java library, batching many `compile()` calls into `compile_all` is
 **not** a meaningful win here — see [Compile an expression](#2-compile-an-expression).
@@ -607,6 +663,14 @@ Measured on an Intel Core i7-1185G7 @ 3.00 GHz (4 cores), Windows 11, CPython
 - **`jsonata-rs` and `jsonata-python` were measured in separate virtualenvs**, for
   the reason in the next section, with jsonata2py present in both as the anchor
   used to normalise across them.
+- **The 2026-08-31 re-measurement used a single process** with `gc.collect()` plus
+  `gc.disable()` inside each timed round and the minimum of nine rounds, no
+  cold-compile rounds interleaved with evaluation rounds. That it reproduced the
+  previously published separate-process figures for the two libraries that did
+  **not** change — `jsonatapy` 257→275 µs, `jsonata-python` 5 471→5 518 µs — is the
+  evidence that the single-process shortcut did not bias the comparison. The GC
+  interference described in the first bullet comes specifically from mixing
+  compile rounds into an evaluation measurement, which this run does not do.
 
 Timings are not portable between machines. Regressions against your own baseline are
 gated by an opt-in check: `pytest tests/benchmarks -m perfgate --perf-record` to
@@ -626,14 +690,18 @@ functions, JSONata libraries, an evaluation timeout, and full `mypy --strict`
 coverage, so it fits best when JSONata is a first-class part of your application
 rather than an occasional utility call.
 
-**Prefer [`jsonatapy`](https://pypi.org/project/jsonatapy/)** when your data is
-already JSON *text* and you want text back — its native `evaluate_json()` keeps
-everything on the Rust side and beats jsonata2py at that. Prefer it too for
-short-lived work where compilation dominates (its cold compile is 27x cheaper, so
-under ~154 evaluations of a given expression it comes out ahead), or for very simple
-expressions over small documents, where there is too little evaluation work for a
-translator to win back. It ships Windows wheels and has the broadest wheel coverage
-of the native options.
+**Prefer [`jsonatapy`](https://pypi.org/project/jsonatapy/)** for short-lived work
+where *compilation* dominates: its cold compile is ~26x cheaper, so under ~49
+evaluations of a given expression it comes out ahead. That is the one workload
+shape where it clearly wins — a CLI, a lambda, or anything that compiles an
+expression, uses it a handful of times, and exits. It also ships Windows wheels
+and has the broadest wheel coverage of the native options.
+
+Two reasons to reach for it that this page used to give no longer hold: its
+text-in/text-out `evaluate_json()` is **no longer** faster than jsonata2py doing
+`json.loads` → `evaluate` → `json.dumps` (255 µs against 183 µs), and it is no
+longer faster on simple expressions over small documents either — see
+[the scaling table](#why-a-pure-python-library-beats-two-native-ones-here).
 
 **Prefer [`jsonata-rs`](https://pypi.org/project/jsonata-rs/)** if you specifically
 want its Rust implementation of the jsonata-java reference semantics and you are on
@@ -642,13 +710,13 @@ wheel**, so Windows users need a Rust toolchain to install it at all; and it
 installs a top-level module named `jsonata` — the *same* name
 [`jsonata-python`](https://pypi.org/project/jsonata-python/) uses — so the two
 silently overwrite each other and cannot coexist in one environment. On this
-workload it measured ~2.5x slower than jsonata2py.
+workload it measured ~4x slower than jsonata2py.
 
 **Prefer [`jsonata-python`](https://pypi.org/project/jsonata-python/)** when you
 want the closest thing to the reference implementation and performance genuinely
 does not matter — a one-off script, a test fixture, a CLI that evaluates an
 expression once and exits. It is a pure-Python AST interpreter, which makes it easy
-to read and debug, but it evaluates ~26x slower than jsonata2py here *and* compiles
+to read and debug, but it evaluates ~47x slower than jsonata2py here *and* compiles
 more slowly, so there is no workload shape where it is the faster choice.
 
 ## Thread safety
@@ -700,6 +768,19 @@ expression string
 | `jsonata2py.translator` | `Translator` and the code-generation helpers it uses |
 | `jsonata2py.runtime` | Runtime support: `core`, `context` (the `ContextVar`-based evaluation state), `lambdas`, `sequences`, `signature`, `values`, plus `strings/`, `numeric/`, `datetime/` built-in packages |
 | `jsonata2py.loader` | `ExpressionLoader` |
+
+
+## Sibling implementations
+
+The same parse → optimise → translate → compile pipeline exists for three host runtimes:
+
+| Runtime | Project | Host code it generates | Speedup vs. that runtime's reference interpreter |
+|---|---|---|---|
+| JVM | [jsonata-jvm-compiler](https://github.com/vlad-public-code/org.json-kula.jsonata-jvm-compiler) (Java 21) | Java source, compiled in-memory by `javac` | ~40× vs [JSONata4Java](https://github.com/IBM/JSONata4Java) |
+| JavaScript | [jsonata2js](https://github.com/vlad-public-code/org.json-kula.jsonata2js) | a JS function, loaded via `node:vm`'s `compileFunction` | ~45–56× vs [`jsonata`](https://www.npmjs.com/package/jsonata) |
+| Python | [jsonata2py](https://pypi.org/project/jsonata2py/) (this project) | Python source, compiled by the host `compile()` | ~47× vs [`jsonata-python`](https://pypi.org/project/jsonata-python/) |
+
+The JVM implementation is the original, and is the compiler behind [valem.run](https://valem.run/)'s reactive computation engine.
 
 ---
 

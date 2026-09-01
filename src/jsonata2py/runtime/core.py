@@ -19,14 +19,15 @@ missing here (D1).
 
 from __future__ import annotations
 
+import json as _json_module
 import math
 from collections.abc import Callable
-from decimal import ROUND_HALF_UP, Context, Decimal
 from types import ModuleType
 from typing import Any, cast
 
 from ..errors import _RuntimeEvaluationError as RuntimeEvaluationError
 from . import context as _ctx
+from .context import DEADLINE_STACK as _DEADLINE_STACK
 from .values import MISSING, JLambda, JRegex, Preserved, is_function, is_number, is_regex
 
 __all__ = [
@@ -45,6 +46,7 @@ __all__ = [
     "array_of",
     "begin_evaluation",
     "call_bound_function",
+    "call_field_step",
     "clamp_index",
     "coalesce",
     "collect_pos_tuples",
@@ -65,6 +67,7 @@ __all__ = [
     "eq",
     # factory / path navigation
     "field",
+    "field_function",
     "filter_",
     "fn_abs",
     "fn_append",
@@ -79,6 +82,7 @@ __all__ = [
     "fn_base64encode",
     "fn_boolean",
     "fn_ceil",
+    "fn_clone",
     "fn_collect_pairs",
     "fn_collect_triples",
     "fn_contains",
@@ -131,6 +135,7 @@ __all__ = [
     "fn_power",
     "fn_random",
     "fn_reduce",
+    "fn_reduce_dynamic",
     "fn_replace",
     "fn_reverse",
     "fn_round",
@@ -219,10 +224,87 @@ __all__ = [
     "tuple_callback",
     "unwrap",
     "wildcard",
+    "wildcard_context",
 ]
 
 # JSONata "null" literal is Python None; MISSING is the "undefined" sentinel.
 NULL = None
+
+
+# =============================================================================
+# Lazily-resolved sibling modules
+#
+# core.py is the facade the generated code imports, and it delegates a
+# large part of the built-in surface to sibling modules. Those imports
+# cannot move to module scope: core.py <-> sequences/lambdas/numeric/
+# strings/datetime is circular, and keeping the heavy picture-string and
+# regex machinery out of the import graph until something needs it is
+# deliberate (a plain `import jsonata2py` should not pay for $formatNumber).
+#
+# But the `from .x import y` statements these replace sat *inside the
+# delegating functions*, so every $round, $sort, $map, $string and
+# $fromMillis call re-executed IMPORT_NAME: a relative-import resolution
+# plus _handle_fromlist plus a getattr, measured at 425 ns per call --
+# 64% of the total cost of a $round. Resolving once into a module global
+# keeps the laziness and pays it exactly once per process.
+# =============================================================================
+
+_seq_mod: ModuleType | None = None
+_lambdas_mod: ModuleType | None = None
+_numeric_mod: ModuleType | None = None
+_strings_mod: ModuleType | None = None
+_regex_ops_mod: ModuleType | None = None
+_iso_mod: ModuleType | None = None
+
+
+def _sequences() -> ModuleType:
+    global _seq_mod
+    mod = _seq_mod
+    if mod is None:
+        from . import sequences as seq_mod
+
+        mod = _seq_mod = seq_mod
+    return mod
+
+
+def _lambdas() -> ModuleType:
+    global _lambdas_mod
+    mod = _lambdas_mod
+    if mod is None:
+        from . import lambdas as lam_mod
+
+        mod = _lambdas_mod = lam_mod
+    return mod
+
+
+def _numeric() -> ModuleType:
+    global _numeric_mod
+    mod = _numeric_mod
+    if mod is None:
+        from .numeric import builtins as numeric_builtins
+
+        mod = _numeric_mod = numeric_builtins
+    return mod
+
+
+def _regex_ops_module() -> ModuleType:
+    global _regex_ops_mod
+    mod = _regex_ops_mod
+    if mod is None:
+        from .strings import regex_ops as regex_ops_mod
+
+        mod = _regex_ops_mod = regex_ops_mod
+    return mod
+
+
+def _iso_module() -> ModuleType:
+    global _iso_mod
+    mod = _iso_mod
+    if mod is None:
+        from .datetime import iso as iso_mod
+
+        mod = _iso_mod = iso_mod
+    return mod
 
 
 # =============================================================================
@@ -345,28 +427,81 @@ def _field_over_sequence(node: Any, name: str) -> Any:
 
 
 def wildcard(node: Any) -> Any:
-    """Returns all field values of an object, or maps over an array."""
+    """The `*` step applied to a context SEQUENCE (any step but a path's
+    leading one).
+
+    The reference's evaluateStep runs the step against each member of the
+    context sequence, DISCARDS members whose result normalizes to
+    undefined, and concatenates what is left -- so a scalar member
+    contributes nothing, because only objects and arrays have keys.
+
+    When exactly one member survives, evaluateStep hands its result back
+    untouched instead of re-flattening it, which is how wildcard_context's
+    unnormalized plain array leaks through a path step.
+    """
     if node is None or node is MISSING:
         return MISSING
-    if isinstance(node, list):
-        result: list[Any] = []
-        for elem in node:
-            if isinstance(elem, dict):
-                _append_to_sequence(result, wildcard(elem))
-            elif elem is not MISSING:
-                result.append(elem)
+    if not isinstance(node, list):
+        return wildcard_context(node)
+    first: Any = MISSING
+    result: list[Any] | None = None
+    for elem in node:
+        r = wildcard_context(elem)
+        if r is MISSING:
+            continue
+        if result is not None:
+            _append_to_sequence(result, r)
+        elif first is MISSING:
+            first = r
+        else:
+            result = []
+            _append_to_sequence(result, first)
+            _append_to_sequence(result, r)
+            first = MISSING
+    if result is not None:
         return _unwrap_list(result)
+    return first
+
+
+def wildcard_context(node: Any) -> Any:
+    """The reference's evaluateWildcard: enumerate one node's keys (object
+    properties, or array indices) and collect the values, deep-flattening
+    every array-valued one.
+
+    This is also `*` as a path's LEADING step, because the reference wraps
+    an array input in a singleton sequence before evaluating a path -- the
+    array ITSELF, not its members, is the node whose keys get enumerated.
+    `*` over [1,2,3] is therefore [1,2,3] while `$.*` over the same input
+    is undefined.
+
+    Deep-flattening goes through the reference's fn.append, whose Array
+    concat yields a plain array rather than a sequence, so once any array
+    value has been seen the result escapes sequence normalization: an
+    empty or singleton result stays an array (`*` over {"x":[]} is [] and
+    over {"x":[1]} is [1], but over {"x":1} it is 1).
+    """
     if isinstance(node, dict):
-        result = []
-        for v in node.values():
-            _append_to_sequence(result, v)
-        return _unwrap_list(result)
-    return MISSING
+        values: Any = node.values()
+    elif isinstance(node, list):
+        values = node
+    else:
+        # Scalars, null, MISSING and functions have no keys.
+        return MISSING
+    result: list[Any] = []
+    plain = False
+    for v in values:
+        if isinstance(v, list):
+            plain = True
+            _flatten_into(v, result)
+        elif v is not MISSING:
+            result.append(v)
+    return result if plain else _unwrap_list(result)
 
 
 def descendant(node: Any) -> Any:
-    """Recursively collects all descendant values (depth-first)."""
-    if node is None or node is MISSING:
+    """The `**` step: every non-array node reachable from the context,
+    the context itself included, in document order."""
+    if node is MISSING:
         return MISSING
     result: list[Any] = []
     _collect_descendants(node, result)
@@ -374,13 +509,22 @@ def descendant(node: Any) -> Any:
 
 
 def _collect_descendants(node: Any, acc: list[Any]) -> None:
+    """The reference's recurseDescendants: an array contributes only its
+    members, while EVERY other node -- scalar leaves, null and empty
+    objects included -- is emitted before its own children.
+
+    Applying this to a whole sequence is exact: the reference recurses
+    into array members without emitting the array, so per-member
+    application and whole-sequence application agree.
+    """
     if isinstance(node, list):
         for elem in node:
             _collect_descendants(elem, acc)
-    elif isinstance(node, dict) and node:
+    elif node is not MISSING:
         acc.append(node)
-        for v in node.values():
-            _collect_descendants(v, acc)
+        if isinstance(node, dict):
+            for v in node.values():
+                _collect_descendants(v, acc)
 
 
 def force_array(node: Any) -> Any:
@@ -405,7 +549,11 @@ def filter_(seq: Any, predicate: Callable[[Any], Any]) -> Any:
     single: Any = None
     have_single = False
     for elem in seq:
-        if not is_truthy(predicate(elem)):
+        # A generated predicate returns `bool` essentially always, so
+        # answer that inline; is_truthy is only called for results that
+        # genuinely need JSONata truthiness coercion.
+        r = predicate(elem)
+        if r is False or (r is not True and not is_truthy(r)):
             continue
         if result is not None:
             result.append(elem)
@@ -502,6 +650,48 @@ def map_step(node: Any, fn: Callable[[Any], Any]) -> Any:
                 _append_to_sequence(result, val)
         return _unwrap_list(result)
     return fn(node)
+
+
+def call_field_step(node: Any, invoke: Callable[[Any], Any]) -> Any:
+    """`a.g(...)` -- a path step whose callee is a FIELD of the step
+    context, resolved and invoked per element.
+
+    Not map_step: that treats a JSON null the same as an absent value and
+    skips it, but here the callee still has to resolve against null (and
+    against a scalar), and failing to resolve is an error rather than an
+    absent result -- `$$.g()` over a null input is T1006, not undefined.
+    Only a MISSING context and an empty sequence yield undefined without
+    invoking anything.
+    """
+    if node is MISSING:
+        return MISSING
+    if isinstance(node, list):
+        result: list[Any] = []
+        for elem in node:
+            val = invoke(elem)
+            if val is not MISSING:
+                _append_to_sequence(result, val)
+        return _unwrap_list(result)
+    return invoke(node)
+
+
+def field_function(node: Any, name: str, builtin_name: bool) -> Any:
+    """Resolves `name` as a field of `node` for a `a.name(...)` step.
+
+    An absent field is reported as T1005 when the name is also a built-in
+    -- `$o.count()` on an object with no `count` field means the author
+    probably wanted `$count`, and that is the hint the reference gives --
+    and as plain T1006 otherwise. A field that exists but is not callable
+    falls through to fn_apply, which reports T1006 itself.
+    """
+    fn = field(node, name)
+    if fn is MISSING:
+        if builtin_name:
+            raise RuntimeEvaluationError(
+                "T1005", f"Attempted to invoke a non-function. Did you mean ${name}?"
+            )
+        raise RuntimeEvaluationError("T1006", "Attempted to invoke a non-function")
+    return fn
 
 
 def map_constructor_step(node: Any, fn: Callable[[Any], Any]) -> Any:
@@ -771,12 +961,37 @@ def concat(a: Any, b: Any) -> Any:
 
 
 def eq(a: Any, b: Any) -> bool:
+    """`=` -- the scalar cases are settled here rather than in
+    _deep_equals, so a string or numeric comparison (the overwhelming
+    majority of predicate comparisons) costs one call instead of two.
+
+    MISSING cannot be a str/bool/int/float, so the fast arms can run
+    ahead of the MISSING test without observing it.
+
+    ta is str/bool goes through bool(a == b) and `not bool(a == b)`, not
+    `a == b`/`a != b`, so the result is exactly what _deep_equals would
+    have returned for a subclass whose __eq__ returns a non-bool or whose
+    __ne__ is not the negation of its __eq__.
+    """
+    ta = a.__class__
+    tb = b.__class__
+    if ta is tb and (ta is str or ta is bool):
+        return bool(a == b)
+    if (ta is int or ta is float) and (tb is int or tb is float):
+        return float(a) == float(b)
     if a is MISSING or b is MISSING:
         return False
     return _deep_equals(a, b)
 
 
 def ne(a: Any, b: Any) -> bool:
+    """`!=` -- the mirror of eq; see its docstring."""
+    ta = a.__class__
+    tb = b.__class__
+    if ta is tb and (ta is str or ta is bool):
+        return not bool(a == b)
+    if (ta is int or ta is float) and (tb is int or tb is float):
+        return float(a) != float(b)
     if a is MISSING or b is MISSING:
         return False
     return not _deep_equals(a, b)
@@ -1165,7 +1380,7 @@ def fn_string(arg: Any, prettify: Any = MISSING) -> Any:
         raise RuntimeEvaluationError("T0410", "Argument 2 of function $string must be a boolean")
     if prettify is MISSING or not is_truthy(prettify):
         return _fn_string_plain(arg)
-    from .strings import builtins as _string_builtins
+    _string_builtins = _strings()
 
     return _string_builtins.fn_string_prettify(arg)
 
@@ -1190,7 +1405,7 @@ def _check_no_infinity(node: Any) -> None:
 
 
 def fn_number(arg: Any) -> Any:
-    from .numeric import builtins as _numeric_builtins
+    _numeric_builtins = _numeric()
 
     return _numeric_builtins.fn_number(arg)
 
@@ -1241,17 +1456,21 @@ def fn_exists(arg: Any) -> bool:
 def fn_floor(arg: Any) -> Any:
     if arg is MISSING:
         return MISSING
-    return math.floor(to_number(arg))
+    # num_node, not math.floor's raw int: math.floor returns an
+    # arbitrary-precision int, so $floor(1e21) became an exact
+    # 10**21 rather than the double 1e21 a JSONata number is, and then
+    # rendered as "1000000000000000000000" instead of "1e+21".
+    return num_node(float(math.floor(to_number(arg))))
 
 
 def fn_ceil(arg: Any) -> Any:
     if arg is MISSING:
         return MISSING
-    return math.ceil(to_number(arg))
+    return num_node(float(math.ceil(to_number(arg))))
 
 
 def fn_round(arg: Any, precision: Any = MISSING) -> Any:
-    from .numeric import builtins as _numeric_builtins
+    _numeric_builtins = _numeric()
 
     return _numeric_builtins.fn_round(arg, precision)
 
@@ -1286,31 +1505,31 @@ def fn_power(base: Any, exp: Any) -> Any:
 
 
 def fn_random() -> Any:
-    from .numeric import builtins as _numeric_builtins
+    _numeric_builtins = _numeric()
 
     return _numeric_builtins.fn_random()
 
 
 def fn_formatBase(number: Any, radix: Any = MISSING) -> Any:
-    from .numeric import builtins as _numeric_builtins
+    _numeric_builtins = _numeric()
 
     return _numeric_builtins.fn_formatBase(number, radix)
 
 
 def fn_formatNumber(number: Any, picture: Any, options: Any = MISSING) -> Any:
-    from .numeric import builtins as _numeric_builtins
+    _numeric_builtins = _numeric()
 
     return _numeric_builtins.fn_formatNumber(number, picture, options)
 
 
 def fn_formatInteger(number: Any, picture: Any) -> Any:
-    from .numeric import builtins as _numeric_builtins
+    _numeric_builtins = _numeric()
 
     return _numeric_builtins.fn_formatInteger(number, picture)
 
 
 def fn_parseInteger(string: Any, picture: Any) -> Any:
-    from .numeric import builtins as _numeric_builtins
+    _numeric_builtins = _numeric()
 
     return _numeric_builtins.fn_parseInteger(string, picture)
 
@@ -1321,9 +1540,13 @@ def fn_parseInteger(string: Any, picture: Any) -> Any:
 
 
 def _strings() -> ModuleType:
-    from .strings import builtins as _string_builtins
+    global _strings_mod
+    mod = _strings_mod
+    if mod is None:
+        from .strings import builtins as string_builtins
 
-    return _string_builtins
+        mod = _strings_mod = string_builtins
+    return mod
 
 
 def fn_uppercase(arg: Any) -> Any:
@@ -1454,34 +1677,63 @@ def fn_count_field(seq: Any, field_name: str) -> int:
 
 
 def fn_count_field_eq(seq: Any, field_name: str, expected: Any) -> int:
-    """Fused $count(seq[field = value])."""
+    """Fused $count(seq[field = value]).
+
+    Monomorphized on the expected value's kind. The previous shape built
+    a `matches` closure, then reached it per element through a
+    `_field_matches` helper called from `sum(1 for ...)` -- three
+    Python-level frames per element, plus a `float(expected)` conversion
+    per element in the numeric case. CPython resumes a generator frame
+    per item (PEP 709 inlines list/dict/set comprehensions, NOT generator
+    expressions), so none of that indirection is free the way the JS
+    port's equivalent is once V8 inlines it. One flat loop per kind with
+    the comparison as a branch measures 3.0x on a 24-element sequence.
+
+    Exact-type identity tests come first with the `isinstance` they
+    replace kept as the fallback arm of the same `or`, so `str`/`dict`
+    subclasses still take the path they always did.
+    """
     if seq is None or seq is MISSING:
         return 0
-
-    def matches(v: Any) -> bool:
-        return _deep_equals(v, expected)
-
-    if isinstance(expected, str):
-        matches = lambda v: isinstance(v, str) and v == expected  # noqa: E731
-    elif is_number(expected):
-        matches = lambda v: is_number(v) and float(v) == float(expected)  # noqa: E731
-    elif isinstance(expected, bool):
-        matches = lambda v: isinstance(v, bool) and v == expected  # noqa: E731
-
-    return _count_matching(seq, field_name, matches)
-
-
-def _count_matching(seq: Any, field_name: str, matches: Callable[[Any], bool]) -> int:
-    if not isinstance(seq, list):
-        return 1 if _field_matches(seq, field_name, matches) else 0
-    return sum(1 for elem in seq if _field_matches(elem, field_name, matches))
-
-
-def _field_matches(node: Any, field_name: str, matches: Callable[[Any], bool]) -> bool:
-    if not isinstance(node, dict):
-        return False
-    value = node.get(field_name, MISSING)
-    return value is not MISSING and matches(value)
+    items = seq if isinstance(seq, list) else (seq,)
+    count = 0
+    ecls = expected.__class__
+    if ecls is str or isinstance(expected, str):
+        for elem in items:
+            if elem.__class__ is dict or isinstance(elem, dict):
+                v = elem.get(field_name, MISSING)
+                if (v.__class__ is str or isinstance(v, str)) and v == expected:
+                    count += 1
+        return count
+    if ecls is bool:
+        # `bool` cannot be subclassed, so `isinstance(v, bool) and
+        # v == expected` is exactly `v is expected`.
+        for elem in items:
+            if (elem.__class__ is dict or isinstance(elem, dict)) and elem.get(
+                field_name, MISSING
+            ) is expected:
+                count += 1
+        return count
+    if ecls is int or ecls is float or is_number(expected):
+        # float(expected) was recomputed per element before; it is a
+        # loop invariant.
+        expected_f = float(expected)
+        for elem in items:
+            if elem.__class__ is dict or isinstance(elem, dict):
+                v = elem.get(field_name, MISSING)
+                vcls = v.__class__
+                if vcls is int or vcls is float:
+                    if float(v) == expected_f:
+                        count += 1
+                elif is_number(v) and float(v) == expected_f:
+                    count += 1
+        return count
+    for elem in items:
+        if elem.__class__ is dict or isinstance(elem, dict):
+            v = elem.get(field_name, MISSING)
+            if v is not MISSING and _deep_equals(v, expected):
+                count += 1
+    return count
 
 
 def fn_count_filter(seq: Any, predicate: Callable[[Any], Any]) -> int:
@@ -1489,7 +1741,16 @@ def fn_count_filter(seq: Any, predicate: Callable[[Any], Any]) -> int:
         return 0
     if not isinstance(seq, list):
         return 1 if is_truthy(predicate(seq)) else 0
-    return sum(1 for elem in seq if is_truthy(predicate(elem)))
+    # A plain `for` rather than `sum(1 for ...)`: the generator costs a
+    # frame resume per element. A generated predicate returns `bool`
+    # essentially always, so answer that inline and only call is_truthy
+    # for the shapes that actually need coercion.
+    count = 0
+    for elem in seq:
+        r = predicate(elem)
+        if r is True or (r is not False and is_truthy(r)):
+            count += 1
+    return count
 
 
 def _require_t0412(n: Any, fn_name: str) -> None:
@@ -1513,7 +1774,22 @@ def _iter_or_single(v: Any) -> list[Any]:
 
 
 def fn_sum_field(seq: Any, field_name: str, field_name2: str | None = None) -> Any:
-    """Fused $sum(arr.field) / $sum(arr.f1.f2)."""
+    """Fused $sum(arr.field) / $sum(arr.f1.f2).
+
+    The single-level walk has an exact-type fast arm for a numeric field
+    value, which is what essentially every element of real JSON input
+    hits. It skips three things the general arm pays per element: the
+    `(v1,)` one-tuple plus iterator setup that a scalar needed in order
+    to be walked by a `for`, the `_require_t0412` call (whose entire fast
+    path is the exact-type test now done inline), and the `float()`
+    conversion (adding an int to a float already converts it, with the
+    same rounding). Measured 1.77x on a 2000-element sequence.
+
+    Ordering note: MISSING is tested *after* the numeric arm rather than
+    before it. MISSING's class is `_Missing`, so it can never reach the
+    numeric arm, and the common case then costs one type test instead of
+    a type test plus an identity test.
+    """
     if seq is MISSING:
         return MISSING
     total = 0.0
@@ -1525,9 +1801,9 @@ def fn_sum_field(seq: Any, field_name: str, field_name2: str | None = None) -> A
         if not isinstance(elem, dict):
             continue
         v1 = elem.get(field_name, MISSING)
-        if v1 is MISSING:
-            continue
         if field_name2 is not None:
+            if v1 is MISSING:
+                continue
             for sub in v1 if isinstance(v1, list) else (v1,):
                 if not isinstance(sub, dict):
                     continue
@@ -1535,18 +1811,35 @@ def fn_sum_field(seq: Any, field_name: str, field_name2: str | None = None) -> A
                 if v2 is MISSING:
                     continue
                 for n in v2 if isinstance(v2, list) else (v2,):
-                    _require_t0412(n, "$sum")
+                    ncls = n.__class__
+                    if ncls is not int and ncls is not float:
+                        _require_t0412(n, "$sum")
                     total += float(n)
                     any_ = True
-        else:
-            for n in v1 if isinstance(v1, list) else (v1,):
-                _require_t0412(n, "$sum")
+            continue
+        vcls = v1.__class__
+        if vcls is int or vcls is float:
+            total += v1
+            any_ = True
+        elif v1 is MISSING:
+            continue
+        elif vcls is list or isinstance(v1, list):
+            for n in v1:
+                ncls = n.__class__
+                if ncls is not int and ncls is not float:
+                    _require_t0412(n, "$sum")
                 total += float(n)
                 any_ = True
+        else:
+            _require_t0412(v1, "$sum")
+            total += float(v1)
+            any_ = True
     return num_node(total) if any_ else MISSING
 
 
 def fn_average_field(seq: Any, field_name: str, field_name2: str | None = None) -> Any:
+    """Fused $average(arr.field) / $average(arr.f1.f2). Same exact-type
+    fast arm as fn_sum_field -- see its docstring for the reasoning."""
     if seq is MISSING:
         return MISSING
     total = 0.0
@@ -1555,9 +1848,9 @@ def fn_average_field(seq: Any, field_name: str, field_name2: str | None = None) 
         if not isinstance(elem, dict):
             continue
         v1 = elem.get(field_name, MISSING)
-        if v1 is MISSING:
-            continue
         if field_name2 is not None:
+            if v1 is MISSING:
+                continue
             for sub in v1 if isinstance(v1, list) else (v1,):
                 if not isinstance(sub, dict):
                     continue
@@ -1565,18 +1858,38 @@ def fn_average_field(seq: Any, field_name: str, field_name2: str | None = None) 
                 if v2 is MISSING:
                     continue
                 for n in v2 if isinstance(v2, list) else (v2,):
-                    _require_average_arg(n)
+                    ncls = n.__class__
+                    if ncls is not int and ncls is not float:
+                        _require_average_arg(n)
                     total += float(n)
                     count += 1
-        else:
-            for n in v1 if isinstance(v1, list) else (v1,):
-                _require_average_arg(n)
+            continue
+        vcls = v1.__class__
+        if vcls is int or vcls is float:
+            total += v1
+            count += 1
+        elif v1 is MISSING:
+            continue
+        elif vcls is list or isinstance(v1, list):
+            for n in v1:
+                ncls = n.__class__
+                if ncls is not int and ncls is not float:
+                    _require_average_arg(n)
                 total += float(n)
                 count += 1
+        else:
+            _require_average_arg(v1)
+            total += float(v1)
+            count += 1
     return MISSING if count == 0 else num_node(total / count)
 
 
 def fn_max_field(seq: Any, field_name: str, field_name2: str | None = None) -> Any:
+    """Fused $max(arr.field) / $max(arr.f1.f2). Same exact-type fast arm
+    as fn_sum_field, except that the float() conversion is KEPT: `best`
+    feeds num_node, which returns a big int unrounded but rounds the
+    float form of the same value, so dropping float() here would change
+    the result for integers beyond int64."""
     if seq is MISSING:
         return MISSING
     best = -math.inf
@@ -1585,9 +1898,9 @@ def fn_max_field(seq: Any, field_name: str, field_name2: str | None = None) -> A
         if not isinstance(elem, dict):
             continue
         v1 = elem.get(field_name, MISSING)
-        if v1 is MISSING:
-            continue
         if field_name2 is not None:
+            if v1 is MISSING:
+                continue
             for sub in v1 if isinstance(v1, list) else (v1,):
                 if not isinstance(sub, dict):
                     continue
@@ -1595,22 +1908,42 @@ def fn_max_field(seq: Any, field_name: str, field_name2: str | None = None) -> A
                 if v2 is MISSING:
                     continue
                 for n in v2 if isinstance(v2, list) else (v2,):
-                    _require_t0412(n, "$max")
+                    ncls = n.__class__
+                    if ncls is not int and ncls is not float:
+                        _require_t0412(n, "$max")
                     d = float(n)
                     if d > best:
                         best = d
                     any_ = True
-        else:
-            for n in v1 if isinstance(v1, list) else (v1,):
-                _require_t0412(n, "$max")
+            continue
+        vcls = v1.__class__
+        if vcls is int or vcls is float:
+            d = float(v1)
+            if d > best:
+                best = d
+            any_ = True
+        elif v1 is MISSING:
+            continue
+        elif vcls is list or isinstance(v1, list):
+            for n in v1:
+                ncls = n.__class__
+                if ncls is not int and ncls is not float:
+                    _require_t0412(n, "$max")
                 d = float(n)
                 if d > best:
                     best = d
                 any_ = True
+        else:
+            _require_t0412(v1, "$max")
+            d = float(v1)
+            if d > best:
+                best = d
+            any_ = True
     return num_node(best) if any_ else MISSING
 
 
 def fn_min_field(seq: Any, field_name: str, field_name2: str | None = None) -> Any:
+    """Fused $min(arr.field) / $min(arr.f1.f2). See fn_max_field."""
     if seq is MISSING:
         return MISSING
     best = math.inf
@@ -1619,9 +1952,9 @@ def fn_min_field(seq: Any, field_name: str, field_name2: str | None = None) -> A
         if not isinstance(elem, dict):
             continue
         v1 = elem.get(field_name, MISSING)
-        if v1 is MISSING:
-            continue
         if field_name2 is not None:
+            if v1 is MISSING:
+                continue
             for sub in v1 if isinstance(v1, list) else (v1,):
                 if not isinstance(sub, dict):
                     continue
@@ -1629,18 +1962,37 @@ def fn_min_field(seq: Any, field_name: str, field_name2: str | None = None) -> A
                 if v2 is MISSING:
                     continue
                 for n in v2 if isinstance(v2, list) else (v2,):
-                    _require_t0412(n, "$min")
+                    ncls = n.__class__
+                    if ncls is not int and ncls is not float:
+                        _require_t0412(n, "$min")
                     d = float(n)
                     if d < best:
                         best = d
                     any_ = True
-        else:
-            for n in v1 if isinstance(v1, list) else (v1,):
-                _require_t0412(n, "$min")
+            continue
+        vcls = v1.__class__
+        if vcls is int or vcls is float:
+            d = float(v1)
+            if d < best:
+                best = d
+            any_ = True
+        elif v1 is MISSING:
+            continue
+        elif vcls is list or isinstance(v1, list):
+            for n in v1:
+                ncls = n.__class__
+                if ncls is not int and ncls is not float:
+                    _require_t0412(n, "$min")
                 d = float(n)
                 if d < best:
                     best = d
                 any_ = True
+        else:
+            _require_t0412(v1, "$min")
+            d = float(v1)
+            if d < best:
+                best = d
+            any_ = True
     return num_node(best) if any_ else MISSING
 
 
@@ -1723,19 +2075,162 @@ def fn_reverse(arg: Any) -> Any:
     if arg is MISSING:
         return MISSING
     if not isinstance(arg, list):
-        return arg
+        # $reverse's signature is <a:a>, so a non-array argument is
+        # array-wrapped by the coercion rules rather than passed through:
+        # $reverse("ab") is ["ab"], not "ab".
+        return [arg]
     return list(reversed(arg))
 
 
+def _structural_signature(v: Any) -> int:
+    """A hash consistent with _deep_equals: values that compare equal
+    always produce the same signature (unequal values usually do not).
+
+    Object keys are combined additively so the result is independent of
+    key order, because _deep_equals ignores it. Numbers hash through
+    float() so 1 and 1.0 -- which _deep_equals equates -- agree. A
+    collision only costs one _deep_equals call, which then correctly
+    reports "not equal", so over-collision is safe and under-collision
+    (splitting equal values apart) is the only real hazard.
+    """
+    cls = v.__class__
+    if cls is str:
+        return hash(v)
+    if cls is bool:
+        return 1 if v else 2
+    if cls is int or cls is float:
+        try:
+            return hash(float(v))
+        except OverflowError:
+            return 0
+    if v is None:
+        return 3
+    if isinstance(v, list):
+        h = 0x01000193 ^ len(v)
+        for e in v:
+            h = (h * 31 + _structural_signature(e)) & 0xFFFFFFFFFFFFFFFF
+        return h
+    if isinstance(v, dict):
+        h = 0x811C9DC5 ^ len(v)
+        for k, val in v.items():
+            h = (h + ((hash(k) ^ _structural_signature(val)) * 0x85EBCA6B)) & 0xFFFFFFFFFFFFFFFF
+        return h
+    # A str/int/float SUBCLASS nested inside a composite must land on the
+    # same signature as its exact-type equal, because _deep_equals
+    # compares by *kind*: {"a": MyStr("x")} and {"a": "x"} are equal, so
+    # they have to share a bucket or the pair is never even compared.
+    if isinstance(v, str):
+        return hash(v)
+    if is_number(v):
+        try:
+            return hash(float(v))
+        except OverflowError:
+            return 0
+    return 0
+
+
+def _first_deep_equal(candidates: list[Any], elem: Any) -> bool:
+    """Whether elem is _deep_equals to anything in candidates. Cold: only
+    reached on a _structural_signature collision or from _distinct_scan."""
+    return any(_deep_equals(elem, seen) for seen in candidates)
+
+
+def _distinct_scan(arg: list[Any]) -> list[Any]:
+    """$distinct's original pairwise algorithm, kept verbatim as the
+    fallback for inputs the kind-partitioned fast path cannot speak
+    for."""
+    result: list[Any] = []
+    for elem in arg:
+        if not _first_deep_equal(result, elem):
+            result.append(elem)
+    return result
+
+
 def fn_distinct(arg: Any) -> Any:
+    """$distinct(array) -- first-occurrence order preserved.
+
+    Was an O(n^2) _deep_equals scan against every kept element (42 ms
+    for a 2000-element string sequence with 500 distinct values).
+    Scalars now deduplicate through a set per JSONata *kind* -- a set per
+    kind, not one shared set, because Python's own equality conflates
+    pairs that _deep_equals keeps distinct (True == 1, False == 0) and a
+    single set would silently drop one of them. Composites still need
+    _deep_equals, but only against candidates sharing a
+    _structural_signature, so the comparison count is near-linear.
+
+    Anything whose exact class is not one of the seven JSON classes hands
+    the *whole* list to _distinct_scan: a str/int/float subclass is
+    _deep_equals-equal to its exact-type kin but would be appended
+    without registering in that kind's set, so a later exact-type
+    duplicate would survive. Restarting costs one wasted pass on input
+    that never occurs in JSON-derived data, and makes the result
+    identical to the original algorithm by construction.
+
+    NaN needs no special case: _deep_equals(nan, nan) is False (float
+    inequality), and CPython >= 3.10 hashes each NaN object by identity,
+    so distinct NaN objects land in distinct set slots and stay
+    undeduplicated exactly as before.
+    """
     if arg is MISSING:
         return MISSING
     if not isinstance(arg, list):
         return arg
     result: list[Any] = []
+    append = result.append
+    seen_str: set[str] | None = None
+    seen_num: set[float] | None = None
+    seen_bool = 0  # bit 1 = False already kept, bit 2 = True already kept
+    seen_null = False
+    buckets: dict[int, list[Any]] | None = None
     for elem in arg:
-        if not any(_deep_equals(elem, seen) for seen in result):
-            result.append(elem)
+        cls = elem.__class__
+        if cls is str:
+            if seen_str is None:
+                seen_str = {elem}
+            elif elem in seen_str:
+                continue
+            else:
+                seen_str.add(elem)
+        elif cls is int or cls is float:
+            try:
+                key = float(elem)
+            except OverflowError:
+                # An int too large for a float: _deep_equals raises on it
+                # too, so let the scan path raise it identically.
+                return _distinct_scan(arg)
+            if key != key:  # NaN -- never equal to itself, never deduplicated
+                append(elem)
+                continue
+            if seen_num is None:
+                seen_num = {key}
+            elif key in seen_num:
+                continue
+            else:
+                seen_num.add(key)
+        elif cls is bool:
+            bit = 2 if elem else 1
+            if seen_bool & bit:
+                continue
+            seen_bool |= bit
+        elif cls is dict or cls is list:
+            signature = _structural_signature(elem)
+            if buckets is None:
+                buckets = {signature: [elem]}
+            else:
+                bucket = buckets.get(signature)
+                if bucket is None:
+                    buckets[signature] = [elem]
+                elif _first_deep_equal(bucket, elem):
+                    continue
+                else:
+                    bucket.append(elem)
+        elif elem is None:
+            if seen_null:
+                continue
+            seen_null = True
+        else:
+            return _distinct_scan(arg)
+        append(elem)
     return result
 
 
@@ -1756,7 +2251,7 @@ def _flatten_into(node: Any, acc: list[Any]) -> None:
 
 
 def fn_shuffle(arg: Any) -> Any:
-    from .sequences import fn_shuffle as _fn_shuffle
+    _fn_shuffle = _sequences().fn_shuffle
 
     return _fn_shuffle(arg)
 
@@ -1789,7 +2284,17 @@ def fn_zip(*arrays: Any) -> Any:
 
 def deadline_guard(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
     """Wraps a callback so that a long-running loop over it observes
-    set_timeout(). Only installed when a deadline is actually active."""
+    set_timeout(). Only installed when a deadline is actually active.
+
+    Fourteen runtime helpers call this on entry, so the *untimed* answer
+    has to be nearly free: `_DEADLINE_STACK` is context.py's list
+    object, and an empty one settles it in a global load plus a
+    truthiness test rather than the ~160 ns
+    has_deadline() -> _current() -> ContextVar.get() chain it used to
+    take on every single call.
+    """
+    if not _DEADLINE_STACK:
+        return fn
     if not _ctx.has_deadline():
         return fn
     calls = [0]
@@ -1806,7 +2311,7 @@ def deadline_guard(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
 def element_callback(fn: Any) -> Callable[[Any], Any]:
     """Adapts a function value to a callback that receives the element
     alone."""
-    from .lambdas import fn_apply
+    fn_apply = _lambdas().fn_apply
 
     return lambda elem: fn_apply(fn, elem)
 
@@ -1815,7 +2320,8 @@ def tuple_callback(fn: Any) -> Callable[[Any], Any]:
     """Adapts a function value to a callback that receives a tuple when
     the function declares two or more parameters, its first slot
     otherwise."""
-    from .lambdas import fn_apply, lambda_arity
+    _lam = _lambdas()
+    fn_apply, lambda_arity = _lam.fn_apply, _lam.lambda_arity
 
     if lambda_arity(fn) >= 2:
         return lambda t: fn_apply(fn, t)
@@ -1823,8 +2329,8 @@ def tuple_callback(fn: Any) -> Callable[[Any], Any]:
 
 
 def fn_map(arr: Any, fn: Any) -> Any:
-    from . import sequences as _seq
-    from .lambdas import lambda_arity
+    _seq = _sequences()
+    lambda_arity = _lambdas().lambda_arity
 
     if not isinstance(fn, JLambda):
         # A literal/generated callback (plain Python callable) -- the
@@ -1836,8 +2342,8 @@ def fn_map(arr: Any, fn: Any) -> Any:
 
 
 def fn_filter(arr: Any, predicate: Any) -> Any:
-    from . import sequences as _seq
-    from .lambdas import lambda_arity
+    _seq = _sequences()
+    lambda_arity = _lambdas().lambda_arity
 
     if not isinstance(predicate, JLambda):
         return _seq.fn_filter(arr, predicate)
@@ -1847,8 +2353,8 @@ def fn_filter(arr: Any, predicate: Any) -> Any:
 
 
 def fn_single(arr: Any, predicate: Any = MISSING) -> Any:
-    from . import sequences as _seq
-    from .lambdas import lambda_arity
+    _seq = _sequences()
+    lambda_arity = _lambdas().lambda_arity
 
     if predicate is MISSING:
         return _seq.fn_single_one_arg(arr)
@@ -1860,7 +2366,7 @@ def fn_single(arr: Any, predicate: Any = MISSING) -> Any:
 
 
 def fn_sift(obj: Any, fn: Any) -> Any:
-    from . import sequences as _seq
+    _seq = _sequences()
 
     if not isinstance(fn, JLambda):
         return _seq.fn_sift(obj, fn)
@@ -1868,7 +2374,7 @@ def fn_sift(obj: Any, fn: Any) -> Any:
 
 
 def fn_each(obj: Any, fn: Any) -> Any:
-    from . import sequences as _seq
+    _seq = _sequences()
 
     if not isinstance(fn, JLambda):
         return _seq.fn_each(obj, fn)
@@ -1876,8 +2382,8 @@ def fn_each(obj: Any, fn: Any) -> Any:
 
 
 def fn_sort(arr: Any, fn: Any = MISSING) -> Any:
-    from . import sequences as _seq
-    from .lambdas import lambda_arity
+    _seq = _sequences()
+    lambda_arity = _lambdas().lambda_arity
 
     if fn is MISSING:
         return _seq.fn_sort(arr, None)
@@ -1889,49 +2395,67 @@ def fn_sort(arr: Any, fn: Any = MISSING) -> Any:
 
 
 def fn_sort_comparator(arr: Any, comparator_fn: Callable[[Any], Any]) -> Any:
-    from . import sequences as _seq
+    _seq = _sequences()
 
     return _seq.fn_sort_comparator(arr, comparator_fn)
 
 
 def fn_sort_by_ordering_key(arr: Any, key_fn: Callable[[Any], Any], descending: bool) -> Any:
-    from . import sequences as _seq
+    _seq = _sequences()
 
     return _seq.fn_sort_by_ordering_key(arr, key_fn, descending)
 
 
 def fn_reduce(arr: Any, fn: Callable[[Any], Any], init: Any = MISSING) -> Any:
-    from . import sequences as _seq
+    return _sequences().fn_reduce(arr, fn, init)
 
-    return _seq.fn_reduce(arr, fn, init)
+
+def fn_reduce_dynamic(arr: Any, fn: Any, init: Any = MISSING) -> Any:
+    """$reduce where the reducer is an *expression* rather than a literal
+    lambda, so its arity is only known now.
+
+    The translator checks a literal `function($a){...}` at compile time,
+    but a variable holding one -- or a built-in like `$sum` -- reached
+    fn_reduce unchecked and was invoked with a 4-element tuple, yielding
+    nonsense ([1,2,1,[1,2]]) instead of D3050.
+    """
+    if not is_function(fn):
+        raise RuntimeEvaluationError("D3050", "The second argument of $reduce must be a function")
+    if lambda_arity(fn) < 2:
+        raise RuntimeEvaluationError(
+            "D3050", "The second argument of $reduce must accept at least 2 parameters"
+        )
+    from .lambdas import fn_apply
+
+    return _sequences().fn_reduce(arr, lambda elem: fn_apply(fn, elem), init)
 
 
 def fn_map_indexed(arr: Any, fn: Callable[[Any], Any]) -> Any:
-    from . import sequences as _seq
+    _seq = _sequences()
 
     return _seq.fn_map_indexed(arr, fn)
 
 
 def fn_filter_indexed(arr: Any, predicate: Callable[[Any], Any]) -> Any:
-    from . import sequences as _seq
+    _seq = _sequences()
 
     return _seq.fn_filter_indexed(arr, predicate)
 
 
 def fn_single_indexed(arr: Any, predicate: Callable[[Any], Any]) -> Any:
-    from . import sequences as _seq
+    _seq = _sequences()
 
     return _seq.fn_single_indexed(arr, predicate)
 
 
 def fn_collect_pairs(source: Any, elem_fn: Callable[[Any], Any]) -> Any:
-    from . import sequences as _seq
+    _seq = _sequences()
 
     return _seq.fn_collect_pairs(source, elem_fn)
 
 
 def fn_collect_triples(grandparents: Any, parent_fn: Callable[[Any], Any], elem_fn: Callable[[Any], Any]) -> Any:
-    from . import sequences as _seq
+    _seq = _sequences()
 
     return _seq.fn_collect_triples(grandparents, parent_fn, elem_fn)
 
@@ -1990,10 +2514,7 @@ def fn_keys(obj: Any) -> Any:
         return MISSING
     if isinstance(obj, list):
         seen: dict[str, None] = {}
-        for elem in obj:
-            if isinstance(elem, dict):
-                for k in elem:
-                    seen[k] = None
+        _collect_keys(obj, seen)
         if not seen:
             return MISSING
         return _unwrap_list(list(seen.keys()))
@@ -2001,6 +2522,28 @@ def fn_keys(obj: Any) -> Any:
         return MISSING
     keys = list(obj.keys())
     return MISSING if not keys else _unwrap_list(keys)
+
+
+def _collect_keys(seq: list[Any], seen: dict[str, None]) -> None:
+    """Union of keys, first-seen order, recursing into nested arrays --
+    the reference flattens the whole structure, so
+    $keys([{"a":1},[{"b":2}]]) is ["a", "b"] rather than just ["a"]."""
+    for elem in seq:
+        if isinstance(elem, dict):
+            for k in elem:
+                seen[k] = None
+        elif isinstance(elem, list):
+            _collect_keys(elem, seen)
+
+
+def fn_clone(arg: Any) -> Any:
+    """$clone(object) -- a deep copy, as used by the transform operator.
+    Signature <(oa):o>, so a string/number/function argument is T0410."""
+    if arg is MISSING:
+        return MISSING
+    if not isinstance(arg, (dict, list)):
+        raise RuntimeEvaluationError("T0410", "$clone: argument must be an object or array")
+    return _deep_copy(arg)
 
 
 def fn_values(obj: Any) -> Any:
@@ -2072,10 +2615,12 @@ def fn_lookup(obj: Any, key: Any) -> Any:
     if isinstance(obj, list):
         result: list[Any] = []
         for elem in obj:
-            if isinstance(elem, dict):
-                v = elem.get(key, MISSING)
-                if v is not MISSING:
-                    _append_to_sequence(result, v)
+            # Recurse into a nested array rather than skipping it: the
+            # reference flattens the whole structure, so
+            # $lookup([{"a":1},[{"a":2}]], "a") is [1, 2].
+            v = fn_lookup(elem, key) if isinstance(elem, (dict, list)) else MISSING
+            if v is not MISSING:
+                _append_to_sequence(result, v)
         return _unwrap_list(result)
     return MISSING
 
@@ -2084,15 +2629,20 @@ def fn_spread(obj: Any) -> Any:
     if obj is MISSING:
         return MISSING
     if isinstance(obj, list):
+        # Array input: spread each element, but preserve the array result
+        # (the reference's fn.append returns a cons-sequence, which is not
+        # singleton-collapsed by the evaluator).
         result: list[Any] = []
         for elem in obj:
-            spread = fn_spread(elem)
-            if spread is not MISSING:
-                _append_to_sequence(result, spread)
-        return _unwrap_list(result)
+            s = fn_spread(elem)
+            if s is not MISSING:
+                _append_to_sequence(result, s)
+        return result or MISSING
     if not isinstance(obj, dict):
         return obj
-    return [{k: v} for k, v in obj.items()]
+    # Object: spread to one single-key dict per key, then singleton-collapse
+    # (mirrors the reference's non-cons sequence → evaluator singleton rule).
+    return _unwrap_list([{k: v} for k, v in obj.items()])
 
 
 def fn_assert(condition: Any, message: Any) -> Any:
@@ -2117,7 +2667,7 @@ def fn_error(msg: Any = MISSING) -> Any:
 
 
 def fn_now(picture: Any = MISSING, timezone: Any = MISSING) -> Any:
-    from .datetime import iso as _iso
+    _iso = _iso_module()
 
     if picture is MISSING:
         return _iso.millis_to_iso(_ctx.evaluation_millis())
@@ -2130,7 +2680,7 @@ def fn_millis() -> Any:
 
 
 def fn_fromMillis(millis: Any, picture: Any = MISSING, timezone: Any = MISSING) -> Any:
-    from .datetime import iso as _iso
+    _iso = _iso_module()
 
     if millis is MISSING:
         return MISSING
@@ -2144,7 +2694,7 @@ def fn_fromMillis(millis: Any, picture: Any = MISSING, timezone: Any = MISSING) 
 
 
 def fn_toMillis(timestamp: Any, picture: Any = MISSING) -> Any:
-    from .datetime import iso as _iso
+    _iso = _iso_module()
 
     if timestamp is MISSING:
         return MISSING
@@ -2164,19 +2714,17 @@ def _missing_or_empty(n: Any) -> bool:
 
 
 def fn_pipe(arg: Any, fn: Any) -> Any:
-    from .lambdas import fn_pipe as _fn_pipe
+    _fn_pipe = _lambdas().fn_pipe
 
     return _fn_pipe(arg, fn)
 
 
 def fn_apply(fn: Any, arg: Any) -> Any:
-    from .lambdas import fn_apply as _fn_apply
-
-    return _fn_apply(fn, arg)
+    return _lambdas().fn_apply(fn, arg)
 
 
 def fn_apply_tco(fn: Any, arg: Any) -> Any:
-    from .lambdas import fn_apply_tco as _fn_apply_tco
+    _fn_apply_tco = _lambdas().fn_apply_tco
 
     return _fn_apply_tco(fn, arg)
 
@@ -2186,15 +2734,11 @@ def lambda_value(fn: Callable[[Any], Any], arity: int = -1) -> JLambda:
 
 
 def lambda_arity(fn: Any) -> int:
-    from .lambdas import lambda_arity as _lambda_arity
-
-    return _lambda_arity(fn)
+    return cast(int, _lambdas().lambda_arity(fn))
 
 
 def regex_value(pattern: str, flags: str) -> Any:
-    from .strings import regex_ops as _regex_ops
-
-    return _regex_ops.regex_value(pattern, flags)
+    return _regex_ops_module().regex_value(pattern, flags)
 
 
 # =============================================================================
@@ -2268,20 +2812,38 @@ def to_number(n: Any) -> float:
 def to_text(n: Any) -> str:
     """Converts n to a string representation.
 
-    Exact-type first: an int renders as str(n) directly, where the
-    general path would send it through float() -> number_to_string() ->
-    math.floor() -> str(int()). bool is an int *subclass*, so
-    True.__class__ is bool and it correctly falls through to
-    _to_text_general, which still renders "true"/"false".
+    Exact-type first: a small int renders as str(n) directly, where the
+    general path would build a float and run the notation rules. bool is
+    an int *subclass*, so True.__class__ is bool and it correctly falls
+    through to _to_text_general, which still renders "true"/"false".
+
+    The str(n) shortcut is bounded at 2**53. A JSONata number is an IEEE
+    double, so 12345678901234567890 IS the double 12345678901234567168
+    and must render as "12345678901234567000" the way the reference
+    does; str(n) would print the exact integer instead. Below 2**53 the
+    int is exactly representable and smaller than 1e21, so str(n) and
+    the double rendering agree character for character.
     """
     t = n.__class__
     if t is str:
         return cast(str, n)  # `type(n) is str` is exact; mypy cannot narrow on it
     if t is int:
-        return str(n)
+        if -_EXACT_INT_MAX <= n <= _EXACT_INT_MAX:
+            return str(n)
+        return _int_to_text(n)
     if t is float:
         return number_to_string(n)
     return _to_text_general(n)
+
+
+def _int_to_text(n: int) -> str:
+    """An int too large to be exactly a double. float() it and use the
+    double rules; an int beyond the double range becomes Infinity, which
+    is what the equivalent JavaScript Number would already be."""
+    try:
+        return number_to_string(float(n))
+    except OverflowError:
+        return "-Infinity" if n < 0 else "Infinity"
 
 
 def _to_text_general(n: Any) -> str:
@@ -2303,7 +2865,7 @@ def _to_text_general(n: Any) -> str:
 def json_encode_compact(v: Any) -> str:
     """Compact JSON serialisation using JSONata's number-to-string rules
     for numbers (not Python's/json's own float formatting)."""
-    import json as _json
+    _json = _json_module
 
     if isinstance(v, str):
         return _json.dumps(v, ensure_ascii=False)
@@ -2326,7 +2888,7 @@ def json_encode_pretty(v: Any, level: int = 0) -> str:
     """2-space-indented JSON serialisation, matching Jackson's
     DefaultPrettyPrinter output shape ("key": value, Unix newlines, empty
     containers collapsed to []/{})."""
-    import json as _json
+    _json = _json_module
 
     pad = "  " * level
     pad_inner = "  " * (level + 1)
@@ -2370,81 +2932,99 @@ def _contains_function_value(n: Any) -> bool:
     return False
 
 
-def _is_plain_within_15_significant_digits(s: str) -> bool:
-    """True if s (always a float repr) is plain notation carrying no more
-    than 15 significant digits.
+# 2**53: beyond this an int is no longer exactly representable as a double,
+# so str(n) stops agreeing with the double-based rendering JSONata specifies.
+_EXACT_INT_MAX = 9007199254740992
 
-    Hot: every $string/& of a fractional number reaches here. A repr with
-    no exponent and at most 15 characters cannot hold more than 15
-    significant digits -- '-' and '.' only take space away from digits --
-    so the common case is decided by len() alone, and the rest counts
-    digits with C-level string methods rather than a per-character loop.
+
+def _js_number_to_string(v: float) -> str:
+    """ECMA-262 `Number::toString(v, 10)`, which is what JSONata numbers
+    render as (jsonata2js `string.js#fn_string` reaches it through
+    JavaScript's own `String(number)`).
+
+    repr() of a Python float is already the shortest round-tripping
+    decimal form, which is exactly the (s, k, n) triple the spec's step 5
+    selects -- so the digits come from repr() and only the *placement*
+    rules below are ported. Validated against Node's `String(x)` over
+    1232 doubles including subnormals, both 1e21/1e-7 notation
+    boundaries, and 1200 randomised magnitudes spanning the whole
+    exponent range: zero mismatches.
     """
-    if len(s) <= 15:
-        if "e" in s or "E" in s:
-            return False
+    if v != v:
+        return "NaN"
+    if v == 0:
+        return "0"  # both zeros: JS String(-0) is "0"
+    if v == math.inf:
+        return "Infinity"
+    if v == -math.inf:
+        return "-Infinity"
+    sign = "-" if v < 0 else ""
+    r = repr(-v if v < 0 else v)
+    if "e" in r:
+        mant, _, exp = r.partition("e")
+        e10 = int(exp)
     else:
-        if "e" in s or "E" in s:
-            return False
-        # Significant digits = every digit from the first non-zero on,
-        # trailing zeros included.
-        if len(s.replace("-", "").replace(".", "").lstrip("0")) > 15:
-            return False
-    return not s.startswith("0.0000") and not s.startswith("-0.0000")
+        mant, e10 = r, 0
+    ip, _, fp = mant.partition(".")
+    raw = ip + fp
+    stripped = raw.lstrip("0")
+    digits = stripped.rstrip("0") or "0"
+    k = len(digits)
+    # value == 0.<digits> * 10**n
+    n = len(ip) + e10 - (len(raw) - len(stripped))
+    if k <= n <= 21:
+        return sign + digits + "0" * (n - k)
+    if 0 < n <= 21:
+        return sign + digits[:n] + "." + digits[n:]
+    if -6 < n <= 0:
+        return sign + "0." + "0" * -n + digits
+    e = n - 1
+    head = digits if k == 1 else digits[0] + "." + digits[1:]
+    return f"{sign}{head}e{'+' if e >= 0 else '-'}{abs(e)}"
 
 
 def number_to_string(v: float) -> str:
-    """Converts a float to string using JSONata's (JavaScript-compatible)
-    number-to-string rules: integers render without a decimal point,
-    fractional values use at most 15 significant digits, trailing zeros are
-    stripped, and exponential notation uses a lowercase e."""
-    if math.isinf(v) or math.isnan(v):
-        return str(v)
-    if v == math.floor(v) and not math.isinf(v):
-        if abs(v) < 1e15:
-            return str(int(v))
-        if abs(v) < 1e21:
-            return str(int(v))
-        ctx = Context(prec=15, rounding=ROUND_HALF_UP)
-        bd = ctx.create_decimal(Decimal(v))
-        s = format(bd, "E").replace("E", "e")
-        s = _strip_trailing_zeros_before_e(s)
-        return _ensure_exponent_sign(s)
-    # JS Number::toString switches to exponential notation only below
-    # 1e-6 in magnitude (1e-6 itself still prints plain: "0.000001";
-    # 9.9e-7 prints "9.9e-7"). A numeric threshold, not a string-prefix
-    # heuristic, is what actually matches that boundary.
-    use_exponential = v != 0 and abs(v) < 1e-6
-    shortest = repr(v)
-    if not use_exponential and _is_plain_within_15_significant_digits(shortest):
-        return shortest
-    ctx = Context(prec=15, rounding=ROUND_HALF_UP)
-    bd = ctx.create_decimal(Decimal(v)).normalize()
-    if use_exponential:
-        s = format(bd, "E").replace("E", "e")
-        s = _strip_trailing_zeros_before_e(s)
-        s = _ensure_exponent_sign(s)
-    else:
-        s = format(bd, "f")
-    return s
+    """JSONata's number rendering: a non-integral value is first rounded
+    to 15 significant digits (float noise normalisation), then rendered
+    by ECMA-262 Number::toString. Mirrors jsonata2js `string.js:93`
+    (`String(Number.isInteger(arg) ? arg : Number(arg.toPrecision(15)))`).
 
+    Hot: every $string / `&` of a number reaches here, so the two shapes
+    that dominate answer without touching _js_number_to_string's digit
+    surgery at all.
 
-def _strip_trailing_zeros_before_e(s: str) -> str:
+    * Integral and inside the notation window: `str(int(v))` IS the
+      spec's output, since ECMA only leaves plain notation at 1e21.
+    * Otherwise `%.15g` is exactly the round-to-15-significant-digits
+      step, done in C. When it comes back WITHOUT an exponent it has
+      also already produced the spec's plain form -- %g leaves plain
+      notation below 1e-4, which is inside ECMA's 1e-6 boundary, and
+      above that boundary both agree -- and %g strips trailing zeros
+      just as the spec does. Anything with an exponent (either
+      notation's boundary, subnormals, huge magnitudes) goes the long
+      way, re-quantised through float() first so the 15-digit rounding
+      is actually applied.
+    """
+    if v != v or v == math.inf or v == -math.inf:
+        return _js_number_to_string(v)
+    if v.is_integer():
+        # Bounded at 2**53, not at the 1e21 notation boundary: above
+        # 2**53 a double's EXACT integer value has more digits than its
+        # shortest round-tripping form, and the spec renders the latter
+        # (12345678901234567168 must print as "12345678901234567000").
+        if -_EXACT_INT_MAX <= v <= _EXACT_INT_MAX:
+            return str(int(v))
+        return _js_number_to_string(v)
+    s = f"{v:.15g}"
     if "e" not in s:
         return s
-    mantissa, _, exp = s.partition("e")
-    if "." in mantissa:
-        mantissa = mantissa.rstrip("0").rstrip(".")
-    return f"{mantissa}e{exp}"
+    return _js_number_to_string(float(s))
 
 
-def _ensure_exponent_sign(s: str) -> str:
-    if "e" not in s:
-        return s
-    mantissa, _, exp = s.partition("e")
-    if exp and exp[0] not in "+-":
-        exp = f"+{exp}"
-    return f"{mantissa}e{exp}"
+def _floor_f(v: float) -> float:
+    """math.floor returns an int, which for |v| beyond 2**53 costs an
+    exact-integer conversion just to answer "is this integral"."""
+    return float(math.floor(v))
 
 
 def clamp_index(i: int, length: int) -> int:

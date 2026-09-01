@@ -35,12 +35,15 @@ unchanged.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from functools import lru_cache
+from itertools import product
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..errors import _RuntimeEvaluationError as RuntimeEvaluationError
 from . import core as _core
-from .values import MISSING, UNKNOWN_ARITY, is_function
+from .values import MISSING, UNKNOWN_ARITY, is_function, is_regex
 
 if TYPE_CHECKING:
     from ..bindings import JsonataFunctionArguments
@@ -250,3 +253,305 @@ def _parse_param_str(s: str) -> list[ParamSpec] | None:
 
         result.append(ParamSpec(type_, optional, focus, variadic))
     return result
+
+
+# =============================================================================
+# Built-in call validation (jsonata-js `parseSignature`)
+# =============================================================================
+#
+# `coerce` above answers "adapt this argument list to this signature", which
+# is what a *user-defined* function needs. A built-in needs a different
+# question answered: "which parameter did each supplied argument land on, and
+# is the evaluation context standing in for one of them?".
+#
+# The reference answers it by compiling the signature into a regular
+# expression over one-character type symbols -- one capturing group per
+# parameter -- and matching the symbols of the supplied arguments against it
+# (jsonata.js `parseSignature`/`validate`). A parameter marked `-` has its
+# group made optional, so when the arguments cannot fill it the group matches
+# empty and the context value is substituted in its place.
+#
+# That indirection is why the decision cannot be made from the argument
+# *count* alone, and so cannot be made at compile time:
+#
+#     (1.55).$round(1)      -> 1     the number fills `n-`; no substitution
+#     (2).$power(3)         -> 8     `n-n` needs two; the context fills the first
+#
+# Both calls supply one argument. Only the parameter types tell them apart.
+
+
+@dataclass(frozen=True, slots=True)
+class _MatchParam:
+    """One parameter position, with the symbol-regex fragment that matches
+    the arguments it can consume."""
+
+    regex: str
+    type: str
+    context: bool
+    context_regex: re.Pattern[str] | None
+    array: bool
+    subtype: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _Matcher:
+    params: tuple[_MatchParam, ...]
+    regex: re.Pattern[str]
+
+
+_ARRAY_TYPE_NAMES = {
+    "a": "arrays",
+    "b": "booleans",
+    "f": "functions",
+    "n": "numbers",
+    "o": "objects",
+    "s": "strings",
+}
+
+
+def _symbol(value: Any) -> str:
+    """The one-character type symbol the reference's `getSymbol` assigns to
+    a value. `m` marks an absent argument, which every type may match."""
+    if value is MISSING:
+        return "m"
+    if is_function(value) or is_regex(value):
+        return "f"
+    if value is None:
+        return "l"
+    if value is True or value is False:
+        return "b"
+    if isinstance(value, str):
+        return "s"
+    if isinstance(value, (int, float)):
+        return "n"
+    if isinstance(value, list):
+        return "a"
+    return "o"
+
+
+def _find_closing(s: str, start: int, open_: str, close: str) -> int:
+    depth = 1
+    pos = start
+    while pos < len(s) - 1:
+        pos += 1
+        if s[pos] == close:
+            depth -= 1
+            if depth == 0:
+                return pos
+        elif s[pos] == open_:
+            depth += 1
+    return pos
+
+
+@lru_cache(maxsize=128)
+def _compile_matcher(signature: str) -> _Matcher | None:
+    """Ports jsonata.js `parseSignature`. Returns None for a signature this
+    port does not model, so callers fall back to their direct call."""
+    parts: list[dict[str, Any]] = []
+    pos = 1
+    while pos < len(signature):
+        c = signature[pos]
+        if c == ":":
+            break
+        if c in ("s", "n", "b", "l", "o"):
+            parts.append({"regex": f"[{c}m]", "type": c, "array": False})
+        elif c == "a":
+            parts.append({"regex": "[asnblfom]", "type": "a", "array": True})
+        elif c == "f":
+            parts.append({"regex": "f", "type": "f", "array": False})
+        elif c == "j":
+            parts.append({"regex": "[asnblom]", "type": "j", "array": False})
+        elif c == "x":
+            parts.append({"regex": "[asnblfom]", "type": "x", "array": False})
+        elif c == "-":
+            if not parts:
+                return None
+            prev = parts[-1]
+            prev["context"] = True
+            prev["context_regex"] = re.compile(prev["regex"])
+            prev["regex"] += "?"
+        elif c in ("?", "+"):
+            if not parts:
+                return None
+            parts[-1]["regex"] += c
+        elif c == "(":
+            end = _find_closing(signature, pos, "(", ")")
+            choice = signature[pos + 1 : end]
+            if "<" in choice:
+                return None  # parameterised unions -- S0402 in the reference
+            parts.append({"regex": f"[{choice}m]", "type": f"({choice})", "array": False})
+            pos = end
+        elif c == "<":
+            if not parts or parts[-1]["type"] not in ("a", "f"):
+                return None
+            end = _find_closing(signature, pos, "<", ">")
+            parts[-1]["subtype"] = signature[pos + 1 : end]
+            pos = end
+        elif c == ">":
+            pass  # the signature's own closing bracket
+        else:
+            return None
+        pos += 1
+
+    if not parts:
+        return None
+    params = tuple(
+        _MatchParam(
+            regex=p["regex"],
+            type=p["type"],
+            context=p.get("context", False),
+            context_regex=p.get("context_regex"),
+            array=p["array"],
+            subtype=p.get("subtype"),
+        )
+        for p in parts
+    )
+    return _Matcher(params, re.compile("^" + "".join(f"({p.regex})" for p in params) + "$"))
+
+
+def param_count(signature: str) -> int:
+    """The number of parameter positions in signature, or -1 when it is not
+    modelled. -2 marks a variadic signature, whose position count is
+    unbounded."""
+    m = _compile_matcher(signature)
+    if m is None:
+        return -1
+    if any(p.regex.endswith("+") for p in m.params):
+        return -2
+    return len(m.params)
+
+
+def _raise_t0410(matcher: _Matcher, args: list[Any], supplied: str) -> None:
+    """Reports which argument first failed to match, as the reference's
+    `throwValidationError` does."""
+    partial = ""
+    good_to = 0
+    for p in matcher.params:
+        partial += p.regex
+        m = re.match("^" + partial, supplied)
+        if m is None:
+            break
+        good_to = len(m.group(0))
+    raise RuntimeEvaluationError(
+        "T0410", f"Argument {good_to + 1} of function does not match function signature"
+    )
+
+
+def validate_with_context(signature: str, args: list[Any], context: Any) -> list[Any]:
+    """Matches args against signature, substituting context for any focus
+    ('-') parameter the arguments do not reach.
+
+    Raises T0410 when the arguments do not fit the signature, T0411 when the
+    context value is the wrong type to stand in for a parameter, and T0412
+    when an array parameter's element types are wrong.
+    """
+    matcher = _compile_matcher(signature)
+    if matcher is None:
+        return args
+
+    supplied = "".join(_symbol(a) for a in args)
+    m = matcher.regex.match(supplied)
+    if m is None:
+        _raise_t0410(matcher, args, supplied)
+
+    validated: list[Any] = []
+    arg_idx = 0
+    for i, p in enumerate(matcher.params):
+        group = m.group(i + 1)  # type: ignore[union-attr]
+        if group == "":
+            if p.context and p.context_regex is not None:
+                if not p.context_regex.match(_symbol(context)):
+                    raise RuntimeEvaluationError(
+                        "T0411", f"Context value is not a compatible type with argument {arg_idx + 1}"
+                    )
+                validated.append(context)
+            else:
+                validated.append(args[arg_idx] if arg_idx < len(args) else MISSING)
+                arg_idx += 1
+            continue
+        for single in group:
+            arg = args[arg_idx] if arg_idx < len(args) else MISSING
+            if p.type == "a":
+                arg = _validate_array_arg(p, arg, single, group, arg_idx)
+            validated.append(arg)
+            arg_idx += 1
+    return validated
+
+
+def _validate_array_arg(p: _MatchParam, arg: Any, single: str, group: str, arg_idx: int) -> Any:
+    """Applies an array parameter's element-type check and the reference's
+    singleton-to-array promotion."""
+    if single == "m":
+        return MISSING
+    ok = True
+    if p.subtype is not None:
+        if single != "a" and group != p.subtype:
+            ok = False
+        elif single == "a" and arg:
+            item_type = _symbol(arg[0])
+            ok = item_type == p.subtype[0] and all(_symbol(v) == item_type for v in arg)
+    if not ok:
+        raise RuntimeEvaluationError(
+            "T0412",
+            f"Argument {arg_idx + 1} of function must be an array of {_ARRAY_TYPE_NAMES.get(p.subtype or '', 'values')}",
+        )
+    return arg if single == "a" else [arg]
+
+
+def call_builtin_ctx(fn: Any, signature: str, context: Any, args: list[Any]) -> Any:
+    """Invokes a built-in whose arguments do not fill its signature, so the
+    evaluation context may stand in for a focus ('-') parameter.
+
+    The translator emits this only for those call sites; a call that supplies
+    every parameter is compiled to a direct `fn_x(...)` call, which no amount
+    of validation could change.
+    """
+    return fn(*validate_with_context(signature, args, context))
+
+
+_SYMBOLS = ("a", "s", "n", "b", "l", "f", "o", "m")
+
+
+@lru_cache(maxsize=256)
+def direct_call_is_safe(signature: str, argc: int) -> bool:
+    """True when passing argc arguments straight through, one per parameter,
+    is what `validate_with_context` would have produced *whatever* those
+    arguments turn out to be -- so the call needs no runtime validation.
+
+    Decided by exhausting the symbol alphabet rather than by reasoning about
+    it: an argument's type is one of eight symbols, and signatures are at
+    most a handful of parameters wide, so the whole input space is small
+    enough to check outright, once per (signature, arity) and cached. That
+    keeps a hot call like `$string(x)` -- whose leading `x-` parameter
+    accepts every symbol, and so can never be left for the context to fill
+    -- on the direct call it has always compiled to.
+    """
+    matcher = _compile_matcher(signature)
+    if matcher is None or argc > 4 or argc >= len(matcher.params):
+        return False
+    for i, p in enumerate(matcher.params):
+        # Variadic or array params cannot be passed through unchanged.
+        if p.array or p.regex.endswith("+"):
+            return False
+        if i < argc:
+            continue
+        # Parameter i is beyond the supplied arguments.
+        if p.context:
+            # A focus ('-') param here would receive the evaluation context,
+            # a substitution the direct call cannot perform; it also skips
+            # the T0411 type-check for that substitution.
+            return False
+        if not p.regex.endswith("?"):
+            # Required parameter that will not be filled → T0410, not a
+            # no-op pass-through.
+            return False
+    # Every supplied argument must land on the same parameter regardless of
+    # its runtime type. Exhaust the symbol alphabet to confirm.
+    want = [1] * argc + [0] * (len(matcher.params) - argc)
+    for combo in product(_SYMBOLS, repeat=argc):
+        m = matcher.regex.match("".join(combo))
+        if m is None:
+            return False  # some argument type would be an error
+        if [len(m.group(i + 1)) for i in range(len(matcher.params))] != want:
+            return False  # some argument type would shift the assignment
+    return True

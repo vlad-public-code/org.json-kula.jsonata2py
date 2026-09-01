@@ -246,11 +246,11 @@ def gen_reduce(t: Translator, n: FunctionCall, args: list[str], ctx: GenCtx) -> 
     elif isinstance(fn_arg, Lambda):
         lambda_expr = inline_lambda(t, fn_arg, ctx)
     else:
-        # fn is an expression that evaluates to a function value (e.g. a
-        # variable holding a user-defined function). Wrap it so fn_reduce
-        # receives a plain callable.
+        # fn is an expression that evaluates to a function value (a
+        # variable holding one, or a built-in). Its arity is not known
+        # here, so the D3050 check has to happen at runtime.
         fn_code = accept(fn_arg, t, ctx)
-        lambda_expr = f"(lambda _elem: fn_apply({fn_code}, _elem))"
+        return f"fn_reduce_dynamic({arr_expr}, {fn_code}, {init_expr})"
     return f"fn_reduce({arr_expr}, {lambda_expr}, {init_expr})"
 
 

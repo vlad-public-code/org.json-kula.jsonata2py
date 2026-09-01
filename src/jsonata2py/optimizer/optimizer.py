@@ -229,7 +229,7 @@ class _RewriteVisitor(Visitor[AstNode, None]):
                 prev_was_context_binding = False
                 continue
             rewritten = self.rewrite(step)
-            if isinstance(rewritten, PathExpr):
+            if isinstance(rewritten, PathExpr) and not _path_has_wildcard(rewritten):
                 flat.extend(rewritten.steps)
             else:
                 flat.append(rewritten)
@@ -599,3 +599,15 @@ def _lambda_body_ref(node: AstNode | None, name: str, bound: frozenset[str]) -> 
     if isinstance(node, Parenthesized):
         return _lambda_body_ref(node.inner, name, bound)
     return False
+
+
+def _path_has_wildcard(path: PathExpr) -> bool:
+    """True when path contains a WildcardStep or DescendantStep.
+
+    Such paths must NOT be flattened into an outer path because the reference
+    implementation calls evaluatePath for the inner sub-expression, which
+    re-splits a plain input array into its elements before the wildcard step
+    runs. Flattening removes that boundary, causing the wrong element-nesting
+    level to reach the wildcard.
+    """
+    return any(isinstance(s, (WildcardStep, DescendantStep)) for s in path.steps)

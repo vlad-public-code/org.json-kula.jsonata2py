@@ -54,11 +54,21 @@ class GenCtx:
     # #$pos that was stashed into each sort-tuple's second element.
     tuple_pos: str | None = None
 
+    # True while ctx_var still holds the evaluation's top-level input.
+    #
+    # The reference marks that one value as the "outer wrapper" exactly once
+    # (jsonata.js `evaluate`), and a leading `*` enumerates a whole array
+    # only for it; anywhere else the step applies per element. A name test
+    # cannot substitute for this flag -- a block helper's parameter is also
+    # called `_ctx` while holding an ordinary element.
+    at_input_root: bool = True
+
     def with_ctx(self, new_ctx: str) -> GenCtx:
         return GenCtx(
             new_ctx, self.root_var, self.state, self.parent_vars,
             self.in_array_constructor_step, self.array_constructor_preserve,
             self.cross_join_parent, False, self.primary_context_var, self.tuple_pos,
+            False,
         )
 
     def with_ctx_and_parent(self, new_ctx: str) -> GenCtx:
@@ -68,6 +78,7 @@ class GenCtx:
             new_ctx, self.root_var, self.state, (*self.parent_vars, self.ctx_var),
             self.in_array_constructor_step, self.array_constructor_preserve,
             self.cross_join_parent, False, self.primary_context_var, self.tuple_pos,
+            False,
         )
 
     def with_parents(self, new_parent_vars: tuple[str, ...] | list[str]) -> GenCtx:
@@ -75,6 +86,7 @@ class GenCtx:
             self.ctx_var, self.root_var, self.state, tuple(new_parent_vars),
             self.in_array_constructor_step, self.array_constructor_preserve,
             self.cross_join_parent, self.is_tail_position, self.primary_context_var, self.tuple_pos,
+            self.at_input_root,
         )
 
     def with_in_array_constructor_step(self) -> GenCtx:
@@ -82,6 +94,7 @@ class GenCtx:
             self.ctx_var, self.root_var, self.state, self.parent_vars,
             True, self.array_constructor_preserve,
             self.cross_join_parent, False, self.primary_context_var, self.tuple_pos,
+            self.at_input_root,
         )
 
     def with_array_constructor_preserve(self) -> GenCtx:
@@ -89,6 +102,7 @@ class GenCtx:
             self.ctx_var, self.root_var, self.state, self.parent_vars,
             self.in_array_constructor_step, True,
             self.cross_join_parent, False, self.primary_context_var, self.tuple_pos,
+            self.at_input_root,
         )
 
     def with_cross_join_parent(self, cjp: str | None) -> GenCtx:
@@ -96,6 +110,7 @@ class GenCtx:
             self.ctx_var, self.root_var, self.state, self.parent_vars,
             self.in_array_constructor_step, self.array_constructor_preserve,
             cjp, self.is_tail_position, self.primary_context_var, self.tuple_pos,
+            self.at_input_root,
         )
 
     def with_tail_position(self, tp: bool) -> GenCtx:
@@ -103,6 +118,7 @@ class GenCtx:
             self.ctx_var, self.root_var, self.state, self.parent_vars,
             self.in_array_constructor_step, self.array_constructor_preserve,
             self.cross_join_parent, tp, self.primary_context_var, self.tuple_pos,
+            self.at_input_root,
         )
 
     def with_primary_context_var(self, pcv: str | None) -> GenCtx:
@@ -110,6 +126,7 @@ class GenCtx:
             self.ctx_var, self.root_var, self.state, self.parent_vars,
             self.in_array_constructor_step, self.array_constructor_preserve,
             self.cross_join_parent, self.is_tail_position, pcv, self.tuple_pos,
+            self.at_input_root,
         )
 
     def with_tuple_pos(self, tp: str | None) -> GenCtx:
@@ -117,4 +134,5 @@ class GenCtx:
             self.ctx_var, self.root_var, self.state, self.parent_vars,
             self.in_array_constructor_step, self.array_constructor_preserve,
             self.cross_join_parent, self.is_tail_position, self.primary_context_var, tp,
+            self.at_input_root,
         )

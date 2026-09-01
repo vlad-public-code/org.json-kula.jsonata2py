@@ -105,7 +105,12 @@ def visit_block(t: Translator, node: Block, ctx: GenCtx) -> str:
 
     from .gen_ctx import GenCtx  # local import to avoid a module cycle
 
-    inner_ctx = GenCtx("_ctx", "_root", ctx.state).with_parents(parent_param_names)
+    # The helper's own `_ctx` parameter holds whatever the single call site
+    # passes, so whether it is still the top-level input is the enclosing
+    # context's answer, not a property of the helper.
+    inner_ctx = GenCtx("_ctx", "_root", ctx.state, at_input_root=ctx.at_input_root).with_parents(
+        parent_param_names
+    )
 
     # Activate all holder variables BEFORE compiling the body so
     # visit_variable_ref emits v_name_ref[0] for every holder reference,

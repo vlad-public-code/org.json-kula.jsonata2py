@@ -68,10 +68,12 @@ from ..parser.ast_nodes import (
     WildcardStep,
     accept,
 )
+from ..runtime.signature import direct_call_is_safe as sig_direct_call_is_safe
+from ..runtime.signature import param_count as sig_param_count
 from . import call_codegen, path_codegen, scope_analyzer
 from .block_codegen import visit_block as _visit_block
 from .gen_ctx import GenCtx
-from .gen_state import GenState
+from .gen_state import GenState, emit_callback
 from .module_assembler import build_module
 from .naming import py_string, pyvar, pyvar_ref
 
@@ -99,6 +101,7 @@ _BUILTIN_LAMBDA_WRAPPERS = {
     "reverse": "fn_reverse",
     "flatten": "fn_flatten",
     "distinct": "fn_distinct",
+    "clone": "fn_clone",
     "shuffle": "fn_shuffle",
     "spread": "fn_spread",
     "merge": "fn_merge",
@@ -110,6 +113,97 @@ _BUILTIN_BINARY_LAMBDA_WRAPPERS = {
 }
 
 _ARITH_OPS = {"+", "-", "*", "/", "%"}
+
+# Signatures of the built-ins compiled to a plain `fn_x(...)` call, verbatim
+# from the reference's registration table (jsonata.js `staticFrame.bind`).
+#
+# A call that supplies exactly one argument per parameter is compiled to that
+# direct call. Any other arity goes through `call_builtin_ctx`, because the
+# reference then matches the supplied argument *types* against the signature
+# to decide which parameter each one landed on -- and whether the evaluation
+# context stands in for a leading '-' parameter. See runtime/signature.py.
+#
+# Higher-order built-ins ($map/$filter/$reduce/$single/$sort/$sift/$each) are
+# absent: their arguments are compiled to callbacks, not values, so their
+# codegen cannot be reduced to an argument list.
+_BUILTIN_SIGNATURES = {
+    "abs": "<n-:n>",
+    "append": "<xx:a>",
+    "average": "<a<n>:n>",
+    "base64decode": "<s-:s>",
+    "base64encode": "<s-:s>",
+    "boolean": "<x-:b>",
+    "ceil": "<n-:n>",
+    "clone": "<(oa)-:o>",
+    "contains": "<s-(sf):b>",
+    "count": "<a:n>",
+    "decodeUrl": "<s-:s>",
+    "decodeUrlComponent": "<s-:s>",
+    "distinct": "<x:x>",
+    "encodeUrl": "<s-:s>",
+    "encodeUrlComponent": "<s-:s>",
+    "exists": "<x:b>",
+    "floor": "<n-:n>",
+    "formatBase": "<n-n?:s>",
+    "formatInteger": "<n-s:s>",
+    "formatNumber": "<n-so?:s>",
+    "fromMillis": "<n-s?s?:s>",
+    "join": "<a<s>s?:s>",
+    "keys": "<x-:a<s>>",
+    "length": "<s-:n>",
+    "lookup": "<x-s:x>",
+    "lowercase": "<s-:s>",
+    "match": "<s-f<s:o>n?:a<o>>",
+    "max": "<a<n>:n>",
+    "merge": "<a<o>:o>",
+    "min": "<a<n>:n>",
+    "not": "<x-:b>",
+    "number": "<(nsb)-:n>",
+    "pad": "<s-ns?:s>",
+    "parseInteger": "<s-s:n>",
+    "power": "<n-n:n>",
+    "replace": "<s-(sf)(sf)n?:s>",
+    "reverse": "<a:a>",
+    "round": "<n-n?:n>",
+    "shuffle": "<a:a>",
+    "split": "<s-(sf)n?:a<s>>",
+    "spread": "<x-:a<o>>",
+    "sqrt": "<n-:n>",
+    "string": "<x-b?:s>",
+    "substring": "<s-nn?:s>",
+    "substringAfter": "<s-s:s>",
+    "substringBefore": "<s-s:s>",
+    "sum": "<a<n>:n>",
+    "toMillis": "<s-s?:n>",
+    "trim": "<s-:s>",
+    "type": "<x:s>",
+    "uppercase": "<s-:s>",
+    "zip": "<a+>",
+}
+
+# Parameter positions per signature: -2 marks a variadic signature, whose
+# count is unbounded, so only the empty argument list can under-fill it.
+_BUILTIN_PARAM_COUNTS = {name: sig_param_count(sig) for name, sig in _BUILTIN_SIGNATURES.items()}
+
+
+def _context_dispatch(name: str, argc: int) -> str | None:
+    """The signature to validate against when argc cannot fill the built-in's
+    parameters, or None when the direct call is provably equivalent.
+
+    Most under-filled calls still cannot need the context: `$string(x)`
+    supplies one of two parameters, but the leading `x-` accepts every type,
+    so the argument always lands on it. `sig_direct_call_is_safe` separates
+    those from the calls whose outcome genuinely depends on runtime types,
+    keeping the hot ones on a direct call.
+    """
+    n = _BUILTIN_PARAM_COUNTS.get(name)
+    if n is None:
+        return None
+    sig = _BUILTIN_SIGNATURES[name]
+    under_filled = argc == 0 if n == -2 else argc != n
+    if under_filled and not sig_direct_call_is_safe(sig, argc):
+        return sig
+    return None
 
 
 def _is_arith_op(op: str) -> bool:
@@ -233,7 +327,7 @@ class Translator(Visitor[str, GenCtx]):
         return f"field({ctx.ctx_var}, {py_string(n.name)})"
 
     def visit_wildcard_step(self, n: WildcardStep, ctx: GenCtx) -> str:
-        return f"wildcard({ctx.ctx_var})"
+        return f"wildcard_context({ctx.ctx_var})"
 
     def visit_descendant_step(self, n: DescendantStep, ctx: GenCtx) -> str:
         return f"descendant({ctx.ctx_var})"
@@ -423,9 +517,9 @@ class Translator(Visitor[str, GenCtx]):
                         f"{py_string(arg0.predicate.left.name)}, {accept(arg0.predicate.right, self, arg_ctx)})"
                     )
                 src_expr = accept(arg0.source, self, arg_ctx)
-                elem_var = f"_cf{ctx.state.next_id()}"
-                pred_expr = accept(arg0.predicate, self, arg_ctx.with_ctx(elem_var))
-                return f"fn_count_filter({src_expr}, lambda {elem_var}: {pred_expr})"
+                pred = arg0.predicate
+                cb = emit_callback(pred, arg_ctx, "_cf", lambda v: accept(pred, self, arg_ctx.with_ctx(v)))
+                return f"fn_count_filter({src_expr}, {cb})"
             if (
                 isinstance(arg0, PathExpr)
                 and len(arg0.steps) == 2
@@ -477,6 +571,16 @@ class Translator(Visitor[str, GenCtx]):
 
         name = n.name
         a = args
+
+        # An argument list that does not fill the built-in's parameters may
+        # need the evaluation context substituted into one of them, and which
+        # one depends on the argument *types* -- so the decision belongs at
+        # runtime. Everything below this point compiles a call that supplies
+        # every parameter, where no substitution is possible.
+        sig = _context_dispatch(name, len(a))
+        if sig is not None:
+            return f"call_builtin_ctx(fn_{name}, {py_string(sig)}, {ctx.ctx_var}, [{', '.join(a)}])"
+
         if name == "string":
             return (
                 f"fn_string({ctx_arg(a, ctx.ctx_var)})" if len(a) <= 1 else f"fn_string({a[0]}, {a[1]})"
@@ -587,6 +691,8 @@ class Translator(Visitor[str, GenCtx]):
             return f"fn_append({a[0]}, {a[1]})"
         if name == "reverse":
             return f"fn_reverse({one_arg(a)})"
+        if name == "clone":
+            return f"fn_clone({one_arg(a)})"
         if name == "distinct":
             return f"fn_distinct({one_arg(a)})"
         if name == "flatten":
@@ -721,11 +827,13 @@ class Translator(Visitor[str, GenCtx]):
         src_expr = accept(n.source, self, ctx)
         result = src_expr
         for sk in reversed(n.keys):
-            key_var = f"_sk{ctx.state.next_id()}"
-            key_expr = accept(sk.key, self, ctx.with_ctx(key_var))
-            sorted_call = f"fn_sort({result}, lambda {key_var}: {key_expr})"
+            cb = self._sort_key_callback(sk.key, ctx)
+            sorted_call = f"fn_sort({result}, {cb})"
             result = f"fn_reverse({sorted_call})" if sk.descending else sorted_call
         return f"unwrap({result})"
+
+    def _sort_key_callback(self, key: AstNode, ctx: GenCtx) -> str:
+        return emit_callback(key, ctx, "_sk", lambda v: accept(key, self, ctx.with_ctx(v)))
 
     @staticmethod
     def _max_parent_depth(keys: list[SortKey]) -> int:
@@ -748,9 +856,8 @@ class Translator(Visitor[str, GenCtx]):
             src_expr = accept(source_path, self, ctx)
             result = src_expr
             for sk in reversed(n.keys):
-                key_var = f"_sk{ctx.state.next_id()}"
-                key_expr = accept(sk.key, self, ctx.with_ctx(key_var))
-                sorted_call = f"fn_sort({result}, lambda {key_var}: {key_expr})"
+                cb = self._sort_key_callback(sk.key, ctx)
+                sorted_call = f"fn_sort({result}, {cb})"
                 result = f"fn_reverse({sorted_call})" if sk.descending else sorted_call
             return f"unwrap({result})"
 
@@ -916,26 +1023,23 @@ class Translator(Visitor[str, GenCtx]):
 
     def visit_transform_expr(self, n: TransformExpr, ctx: GenCtx) -> str:
         src_expr = accept(n.source, self, ctx)
-        loc_var = f"_tl{ctx.state.next_id()}"
-        loc_expr = accept(n.pattern, self, ctx.with_ctx(loc_var))
-        upd_var = f"_tu{ctx.state.next_id()}"
-        upd_expr = accept(n.update, self, ctx.with_ctx(upd_var))
+        pattern = n.pattern
+        update = n.update
+        loc_cb = emit_callback(pattern, ctx, "_tl", lambda v: accept(pattern, self, ctx.with_ctx(v)))
+        upd_cb = emit_callback(update, ctx, "_tu", lambda v: accept(update, self, ctx.with_ctx(v)))
         del_expr = accept(n.delete, self, ctx) if n.delete is not None else "MISSING"
-        return (
-            f"fn_transform({src_expr}, lambda {loc_var}: {loc_expr}, "
-            f"lambda {upd_var}: {upd_expr}, {del_expr})"
-        )
+        return f"fn_transform({src_expr}, {loc_cb}, {upd_cb}, {del_expr})"
 
     def visit_transform_lambda(self, n: TransformLambda, ctx: GenCtx) -> str:
         src_var = f"_ts{ctx.state.next_id()}"
-        loc_var = f"_tl{ctx.state.next_id()}"
-        loc_expr = accept(n.pattern, self, ctx.with_ctx(loc_var))
-        upd_var = f"_tu{ctx.state.next_id()}"
-        upd_expr = accept(n.update, self, ctx.with_ctx(upd_var))
+        pattern = n.pattern
+        update = n.update
+        loc_cb = emit_callback(pattern, ctx, "_tl", lambda v: accept(pattern, self, ctx.with_ctx(v)))
+        upd_cb = emit_callback(update, ctx, "_tu", lambda v: accept(update, self, ctx.with_ctx(v)))
         del_expr = accept(n.delete, self, ctx) if n.delete is not None else "MISSING"
         return (
-            f"lambda_value(lambda {src_var}: fn_transform({src_var}, lambda {loc_var}: {loc_expr}, "
-            f"lambda {upd_var}: {upd_expr}, {del_expr}), 1)"
+            f"lambda_value(lambda {src_var}: fn_transform({src_var}, {loc_cb}, "
+            f"{upd_cb}, {del_expr}), 1)"
         )
 
 

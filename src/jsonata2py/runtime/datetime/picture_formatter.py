@@ -6,15 +6,26 @@ Ported from org.json_kula.jsonata_jvm.runtime.datetime.PictureFormatter.
 
 from __future__ import annotations
 
-import math
 import re
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from datetime import date as _date
+from functools import lru_cache
+from typing import NamedTuple
 
 from ...errors import _RuntimeEvaluationError as RuntimeEvaluationError
-from . import roman as _roman
+from ..numeric import integer_picture as _int_picture
+from . import epoch as _epoch
 from . import timezones as _timezones
-from . import word_numbers as _words
+
+# A picture string (and therefore any modifier sliced out of it) can come
+# from input data -- `$fromMillis(t, doc.pic)` -- so its length is
+# caller-controlled. lru_cache's maxsize bounds the ENTRY COUNT, not the
+# memory those entries retain: measured on an equivalent cache, 60 distinct
+# 200 KB pictures held 12.3 MB, and a full 256-entry cache of them ~51 MB.
+# A real picture is tens of characters, so anything longer is simply not
+# cached -- identical result, slower, O(1) memory.
+_MAX_CACHEABLE_PICTURE = 256
 
 _WS_RE = re.compile(r"\s+")
 
@@ -32,7 +43,11 @@ _MONTH_NAMES_NARROW = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D
 
 def format(millis: int, picture: str, timezone: str | None) -> str:
     offset = UTC if not timezone else _timezones.parse_zone_offset(timezone)
-    dt = datetime.fromtimestamp(millis / 1000.0, tz=UTC).astimezone(offset)
+    # _epoch, not datetime.fromtimestamp: the latter goes through the
+    # platform C library, which rejects every negative timestamp on
+    # Windows -- so $fromMillis of any pre-1970 instant raised instead of
+    # formatting, for every picture string.
+    dt = _epoch.to_datetime(millis, offset)
     return _apply_picture(dt, picture)
 
 
@@ -41,29 +56,106 @@ def format(millis: int, picture: str, timezone: str | None) -> str:
 # =============================================================================
 
 
+# A component handler: (timestamp, modifier) -> rendered text.
+_Handler = Callable[[datetime, str], str]
+
+# (leading literal, ((handler, modifier, trailing literal), ...)).
+_Compiled = tuple[str, tuple[tuple[_Handler, str, str], ...]]
+
+
 def _apply_picture(dt: datetime, picture: str) -> str:
+    head, items = _compile_picture(picture)
+    if not items:
+        return head
+    out: list[str] = [head]
+    append = out.append
+    for handler, mod, literal in items:
+        append(handler(dt, mod))
+        append(literal)
+    return "".join(out)
+
+
+def _compile_picture(picture: str) -> _Compiled:
+    if len(picture) > _MAX_CACHEABLE_PICTURE:
+        return _uncached__compile_picture(picture)
+    return _cached__compile_picture(picture)
+
+
+@lru_cache(maxsize=256)
+def _cached__compile_picture(picture: str) -> _Compiled:
+    return _uncached__compile_picture(picture)
+
+
+def _uncached__compile_picture(picture: str) -> _Compiled:
+    """Splits the picture into its literal runs and its variable components,
+    resolving each component to the handler that renders it.
+
+    Memoized, because the picture is a compile-time literal at essentially
+    every `$fromMillis` call site -- jsonata2js re-scans it on every call and
+    even says so, `datetime.js:884`: `// TODO can cache this against the
+    picture`. Nothing in the result depends on the timestamp, the timezone or
+    any other per-evaluation state, and the result is a tuple of tuples of
+    strings and functions, so a cached entry is immutable and safe to share
+    across evaluations and threads.
+
+    D3135 escapes the cache, since `lru_cache` does not memoise exceptions --
+    which is what we want: it stays raised on every call. An unknown component
+    is deliberately NOT raised here but resolved to a raising handler, so it
+    still fires in picture order: `[YN]-[q]` must report `[YN]`'s D3133, not
+    the unknown `[q]`.
+    """
     check_brackets(picture)
-    out: list[str] = []
+    head = ""
+    items: list[tuple[_Handler, str, str]] = []
+    buf: list[str] = []
     i = 0
     n = len(picture)
     while i < n:
         c = picture[i]
         if c == "[" and i + 1 < n and picture[i + 1] == "[":
-            out.append("[")
+            buf.append("[")
             i += 2
         elif c == "[":
             j = picture.find("]", i + 1)
             if j < 0:
                 raise _unclosed()
-            out.append(_format_component(dt, picture[i + 1 : j]))
+            spec = _WS_RE.sub("", picture[i + 1 : j])
             i = j + 1
+            # `[]` and `[ ]` format as the empty string, so they just merge
+            # into the surrounding literal run.
+            if not spec:
+                continue
+            literal = "".join(buf)
+            buf.clear()
+            if items:
+                # The literal that preceded this component terminates the
+                # previous one; the very first run is the head.
+                handler, mod, _ = items[-1]
+                items[-1] = (handler, mod, literal)
+            else:
+                head = literal
+            resolved = _COMPONENTS.get(spec[0])
+            items.append((resolved if resolved is not None else _unknown_component(spec), spec[1:], ""))
         elif c == "]" and i + 1 < n and picture[i + 1] == "]":
-            out.append("]")
+            buf.append("]")
             i += 2
         else:
-            out.append(c)
+            buf.append(c)
             i += 1
-    return "".join(out)
+    tail = "".join(buf)
+    if items:
+        handler, mod, _ = items[-1]
+        items[-1] = (handler, mod, tail)
+    else:
+        head = tail
+    return head, tuple(items)
+
+
+def _unknown_component(spec: str) -> _Handler:
+    def raise_unknown(dt: datetime, mod: str) -> str:
+        raise RuntimeEvaluationError(None, f"Unknown picture-string component: [{spec}]")
+
+    return raise_unknown
 
 
 # =============================================================================
@@ -71,89 +163,140 @@ def _apply_picture(dt: datetime, picture: str) -> str:
 # =============================================================================
 
 
-def _format_component(dt: datetime, spec: str) -> str:
-    if not spec:
-        return ""
-    spec = _WS_RE.sub("", spec)
-    d = spec[0]
-    mod = spec[1:]
+def _present(value: int, mod: str) -> str | None:
+    """Renders `value` when `mod` selects a non-decimal numbering, else
+    None so the caller falls through to its decimal path.
 
-    if d == "Y":
-        return _format_year(dt, mod)
-    if d == "X":
-        iso_year, _iso_week, _iso_wd = dt.isocalendar()
-        return _format_int(iso_year, mod, 4)
-    if d == "W":
-        _iso_year, iso_week, _iso_wd = dt.isocalendar()
-        return _format_int(iso_week, mod, 2)
-    if d == "w":
-        return _format_week_of_month(dt, mod)
-    if d == "x":
-        return _format_week_of_month_context(dt, mod)
-    if d == "M":
-        return _format_month(dt, mod)
-    if d == "D":
-        return _format_day_of_month(dt, mod)
-    if d == "d":
-        return _format_day_of_year(dt, mod)
-    if d == "F":
-        return _format_day_name(dt, mod)
-    if d == "H":
-        return _format_int(dt.hour, mod, 2)
-    if d == "h":
-        h = dt.hour % 12
-        return _format_int(12 if h == 0 else h, mod, 2)
-    if d in ("C", "E"):
-        return "ISO"
-    if d == "m":
-        return _format_int(dt.minute, mod if mod else "01", 2)
-    if d == "s":
-        return _format_int(dt.second, mod if mod else "01", 2)
-    if d == "f":
-        return _format_millis(dt.microsecond // 1000, mod)
-    if d == "P":
-        return _format_am_pm(dt, mod)
-    if d == "Z":
-        return _format_offset_z(dt.utcoffset(), mod)
-    if d == "z":
-        return _format_offset_name(dt.utcoffset())
-    raise RuntimeEvaluationError(None, f"Unknown picture-string component: [{spec}]")
+    §9.8.4.3 of XPath F&O routes every integer-valued date/time component
+    through the *same* integer formatter `$formatInteger` uses, which is
+    what the reference does (jsonata2js `datetime.js:906`,
+    `_formatInteger(componentValue, markerSpec.integerFormat)`). Python
+    instead hand-wrote a partial modifier set per component, so `[Ya]`,
+    `[YA]`, `[YWw]`, `[DW]`, `[Mw]` and friends silently fell back to
+    plain decimal or raised.
+
+    Sharing `integer_picture.format` also means `$formatInteger` and
+    these components can never drift apart again. The one translation
+    needed is the ordinal marker: a date/time modifier spells it as a
+    trailing "o" (`[D1o]`, `[Dwo]`) where an integer picture spells it
+    as a `;o` suffix.
+
+    Which integer picture a modifier maps to is picture-only, so the
+    translation is memoized by `_present_picture` and only the final
+    `integer_picture.format` call is left per timestamp.
+    """
+    pic = _present_picture(mod)
+    if pic is None:
+        return None
+    return _int_picture.format(value, pic)
+
+
+def _present_picture(mod: str) -> str | None:
+    if len(mod) > _MAX_CACHEABLE_PICTURE:
+        return _uncached__present_picture(mod)
+    return _cached__present_picture(mod)
+
+
+@lru_cache(maxsize=512)
+def _cached__present_picture(mod: str) -> str | None:
+    return _uncached__present_picture(mod)
+
+
+def _uncached__present_picture(mod: str) -> str | None:
+    """The `$formatInteger` picture a date/time modifier selects, or None when
+    it selects plain decimal and the caller must fall through."""
+    if not mod:
+        return None
+    core = mod.split(",", 1)[0]
+    ordinal = len(core) > 1 and core.endswith("o")
+    if ordinal:
+        core = core[:-1]
+    if not core or core[0] not in "aAiIwW":
+        return None
+    return f"{core};o" if ordinal else core
+
+
+# One handler per component letter, resolved once by `_compile_picture`. The
+# reference walks a `switch` on every component of every call
+# (datetime.js:892-1000); a dict probe at compile time replaces the whole
+# chain of up to eighteen string comparisons per component per call.
+
+
+def _format_iso_year(dt: datetime, mod: str) -> str:
+    iso_year, _iso_week, _iso_wd = dt.isocalendar()
+    return _present(iso_year, mod) or _format_int(iso_year, mod, 4)
+
+
+def _format_iso_week(dt: datetime, mod: str) -> str:
+    _iso_year, iso_week, _iso_wd = dt.isocalendar()
+    return _present(iso_week, mod) or _format_int(iso_week, mod, 2)
+
+
+def _format_hour24(dt: datetime, mod: str) -> str:
+    return _present(dt.hour, mod) or _format_int(dt.hour, mod, 2)
+
+
+def _format_hour12(dt: datetime, mod: str) -> str:
+    h12 = dt.hour % 12 or 12
+    return _present(h12, mod) or _format_int(h12, mod, 2)
+
+
+def _format_calendar(dt: datetime, mod: str) -> str:
+    return "ISO"
+
+
+def _format_minute(dt: datetime, mod: str) -> str:
+    return _present(dt.minute, mod) or _format_int(dt.minute, mod if mod else "01", 2)
+
+
+def _format_second(dt: datetime, mod: str) -> str:
+    return _present(dt.second, mod) or _format_int(dt.second, mod if mod else "01", 2)
+
+
+def _format_fraction(dt: datetime, mod: str) -> str:
+    ms = dt.microsecond // 1000
+    return _present(ms, mod) or _format_millis(ms, mod)
+
+
+def _format_offset_z_component(dt: datetime, mod: str) -> str:
+    return _format_offset_z(dt.utcoffset(), mod)
+
+
+def _format_offset_name_component(dt: datetime, mod: str) -> str:
+    return _format_offset_name(dt.utcoffset(), mod)
 
 
 def _format_year(dt: datetime, mod: str) -> str:
-    if mod:
-        if mod in ("N", "n"):
-            raise RuntimeEvaluationError("D3133", "Year name component is not supported")
-        if mod == "I":
-            return _roman.to_roman(dt.year)
-        if mod == "i":
-            return _roman.to_roman(dt.year).lower()
-        if mod in ("w", "W"):
-            return _words.to_cardinal(dt.year)
+    if mod in ("N", "n"):
+        raise RuntimeEvaluationError("D3133", "Year name component is not supported")
+    presented = _present(dt.year, mod)
+    if presented is not None:
+        return presented
+    if mod and "o" in mod:
+        # An ordinal needs a digit or alphabetic picture to attach to;
+        # a bare `[Yo]` is rejected by the reference with D3130.
+        digits = mod.replace("o", "")
+        if not digits:
+            raise RuntimeEvaluationError("D3130", "$formatInteger: invalid picture string")
+        return _int_picture.format(dt.year, f"{digits};o")
     return _format_int(dt.year, mod, 4)
 
 
 def _format_month(dt: datetime, mod: str) -> str:
-    if mod and mod[0].isalpha():
-        if mod in ("a", "A"):
-            return _to_alphabetic(dt.month, mod == "A")
-        if mod[0] in ("n", "N"):
-            return _format_month_name(dt, mod)
-        if mod == "i":
-            return _roman.to_roman(dt.month).lower()
-        if mod == "I":
-            return _roman.to_roman(dt.month)
+    if mod and mod[0] in ("n", "N"):
+        return _format_month_name(dt, mod)
+    presented = _present(dt.month, mod)
+    if presented is not None:
+        return presented
     return _format_int(dt.month, mod, 2)
 
 
 def _format_day_of_month(dt: datetime, mod: str) -> str:
-    if mod:
-        if "w" in mod:
-            return _words.to_ordinal(dt.day)
-        if "o" in mod:
-            return _format_ordinal_suffix(dt.day)
-        if mod in ("a", "A"):
-            return _to_alphabetic(dt.day, mod == "A")
+    presented = _present(dt.day, mod)
+    if presented is not None:
+        return presented
+    if mod and "o" in mod:
+        return _format_ordinal_suffix(dt.day)
     return _format_int(dt.day, mod, 2)
 
 
@@ -162,9 +305,11 @@ def _day_of_year(dt: datetime) -> int:
 
 
 def _format_day_of_year(dt: datetime, mod: str) -> str:
-    if mod and "w" in mod:
-        return _words.to_ordinal(_day_of_year(dt))
-    return _format_int(_day_of_year(dt), mod, 3)
+    doy = _day_of_year(dt)
+    presented = _present(doy, mod)
+    if presented is not None:
+        return presented
+    return _format_int(doy, mod, 3)
 
 
 def _format_day_name(dt: datetime, mod: str) -> str:
@@ -224,6 +369,11 @@ def _format_offset_z(delta: timedelta | None, mod: str) -> str:
     use_colon = True
     short_format = "t" in mod
 
+    # A names presentation ('N') carries no digit count, so there is no
+    # width for the offset: the reference rejects it (jsonata2js
+    # `datetime.js:926`, D3134) rather than silently formatting.
+    if mod and not any(c.isdigit() for c in mod) and any(c.isalpha() for c in mod if c != "t"):
+        raise RuntimeEvaluationError("D3134", f"Invalid timezone picture modifier: {mod}")
     if mod:
         if ":" in mod:
             use_colon = True
@@ -262,15 +412,36 @@ def _format_offset_z(delta: timedelta | None, mod: str) -> str:
     return f"{sign}{hour_str}:{min_str}" if use_colon else f"{sign}{hour_str}{min_str}"
 
 
-def _format_offset_name(delta: timedelta | None) -> str:
-    total_secs = int(delta.total_seconds()) if delta is not None else 0
-    if total_secs == 0:
-        return "GMT"
-    total_mins = total_secs // 60
+def _format_offset_name(delta: timedelta | None, mod: str) -> str:
+    """`[z]` -- identical to `[Z]` except for the "GMT" prefix, and with
+    no collapse to "Z"/"GMT" for a zero offset: the reference renders
+    +00:00 as "GMT+00:00" (jsonata2js `datetime.js:932-937` only applies
+    the 'Z' collapse when presentation2 is 't', and the GMT prefix is
+    added around the same integer-formatted offset `[Z]` uses).
+
+    A bare `[z]` therefore behaves as `[z01:01]`, and `[z0]` -- one
+    mandatory digit -- prints the hours alone, appending ":mm" only when
+    the minutes are non-zero ("GMT+0", "GMT+5:30", "GMT-8").
+    """
+    total_mins = (int(delta.total_seconds()) // 60) if delta is not None else 0
     h = abs(total_mins) // 60
     m = abs(total_mins) % 60
     sign = "+" if total_mins >= 0 else "-"
-    return f"GMT{sign}{h:02d}:{m:02d}"
+
+    if mod and not any(c.isdigit() for c in mod):
+        raise RuntimeEvaluationError("D3134", f"Invalid timezone picture modifier: {mod}")
+    digits = [c for c in mod if c.isdigit()]
+    if not mod or ":" in mod:
+        body = f"{h:02d}:{m:02d}"
+    elif len(digits) <= 2:
+        body = f"{h}" if len(digits) == 1 else f"{h:02d}"
+        if m != 0:
+            body += f":{m:02d}"
+    elif len(digits) <= 4:
+        body = f"{h:02d}{m:02d}"
+    else:
+        raise RuntimeEvaluationError("D3134", "timezone picture string too long")
+    return f"GMT{sign}{body}"
 
 
 # =============================================================================
@@ -285,14 +456,51 @@ def _monday_on_or_before(d: _date) -> _date:
 
 
 def _format_week_of_month(dt: datetime, mod: str) -> str:
+    """Weeks are counted from the start of the first week of the month --
+    ported from jsonata2js `datetime.js:765-783`. The rule this replaced
+    was day-of-month/7 with ad-hoc corrections, which put 1970-01-01,
+    2024-02-01 and 2025-01-01 in week 5 instead of week 1.
+    """
     date = dt.date()
-    monday = _monday_on_or_before(date)
-    in_current = sum(1 for i in range(7) if (monday + timedelta(days=i)).month == date.month)
-    if in_current <= 3 and date.day >= 28:
-        return "1"
-    if monday.month != date.month and date.day <= 4:
-        return "5"
-    return _format_int(math.ceil(date.day / 7), mod, 1)
+    week = _delta_weeks(_start_of_first_week(date.year, date.month), date)
+    if week > 4:
+        following = _shifted_first_week(date.year, date.month, 1)
+        if following is not None and date >= following:
+            week = 1
+    elif week < 1:
+        previous = _shifted_first_week(date.year, date.month, -1)
+        if previous is not None:
+            week = _delta_weeks(previous, date)
+    return _format_int(week, mod, 1)
+
+
+def _shifted_first_week(year: int, month: int, delta: int) -> _date | None:
+    """First week of the adjacent month, or None when that month falls
+    outside date's year 1..9999 range (JavaScript's Date spans further,
+    so the reference never has to consider it)."""
+    m, y = _shift_month(year, month, delta)
+    try:
+        return _start_of_first_week(y, m)
+    except ValueError:
+        return None
+
+
+def _start_of_first_week(year: int, month: int) -> _date:
+    """Start of the month's first week, per ISO 8601 as extended to
+    months by XPath F&O: the week (Monday-based) containing the month's
+    first Thursday. So when the 1st is a Friday, Saturday or Sunday the
+    first week starts on the FOLLOWING Monday, not the preceding one --
+    the adjustment this function was missing.
+    """
+    first = _date(year, month, 1)
+    dow = first.isoweekday()  # Mon=1 .. Sun=7
+    if dow > 4:
+        return first + timedelta(days=8 - dow)
+    return first - timedelta(days=dow - 1)
+
+
+def _delta_weeks(start: _date, end: _date) -> int:
+    return (end - start).days // 7 + 1
 
 
 def _format_week_of_month_context(dt: datetime, mod: str) -> str:
@@ -326,14 +534,57 @@ def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
     return total % 12 + 1, total // 12
 
 
+_COMPONENTS: dict[str, _Handler] = {
+    "Y": _format_year,
+    "X": _format_iso_year,
+    "W": _format_iso_week,
+    "w": _format_week_of_month,
+    "x": _format_week_of_month_context,
+    "M": _format_month,
+    "D": _format_day_of_month,
+    "d": _format_day_of_year,
+    "F": _format_day_name,
+    "H": _format_hour24,
+    "h": _format_hour12,
+    "C": _format_calendar,
+    "E": _format_calendar,
+    "m": _format_minute,
+    "s": _format_second,
+    "f": _format_fraction,
+    "P": _format_am_pm,
+    "Z": _format_offset_z_component,
+    "z": _format_offset_name_component,
+}
+
+
 # =============================================================================
 # Number formatting helpers
 # =============================================================================
 
 
-def _format_int(value: int, mod: str, default_width: int) -> str:
+class _IntMod(NamedTuple):
+    """`_format_int`'s width modifier, parsed. Depends only on the picture."""
+
+    plain: bool  # the modifier asks for a bare str(value)
+    min_width: int  # 0 -> no zero padding
+    truncate_to: int  # -1 -> never truncate
+    star_group: bool  # `,*` -- insert a "," every three digits
+
+
+def _int_mod(mod: str, default_width: int) -> _IntMod:
+    if len(mod) > _MAX_CACHEABLE_PICTURE:
+        return _uncached__int_mod(mod, default_width)
+    return _cached__int_mod(mod, default_width)
+
+
+@lru_cache(maxsize=512)
+def _cached__int_mod(mod: str, default_width: int) -> _IntMod:
+    return _uncached__int_mod(mod, default_width)
+
+
+def _uncached__int_mod(mod: str, default_width: int) -> _IntMod:
     if not mod or mod == "1" or (mod.startswith("#") and "," not in mod):
-        return str(value)
+        return _IntMod(True, 0, -1, False)
 
     use_thousands_sep = "," in mod
     min_width = default_width
@@ -362,17 +613,33 @@ def _format_int(value: int, mod: str, default_width: int) -> str:
             min_width = w
         has_zeros_in_min_part = "0" in mod
 
-    no_min_width = mod.startswith("9")
-    formatted = str(value) if no_min_width else _zfill_signed(value, min_width)
+    # A leading "9" means "no minimum width", which is exactly what
+    # `_zfill_signed(value, 0)` produces for either sign.
+    if mod.startswith("9"):
+        min_width = 0
 
-    if use_thousands_sep and max_width is not None and len(formatted) > max_width:
+    truncate_to = -1
+    if use_thousands_sep and max_width is not None:
         parts = mod.split(",")
         is_min_max = len(parts) > 1 and "-" in parts[1]
-        no_zeros_in_min = not has_zeros_in_min_part
-        if is_min_max or no_zeros_in_min:
-            formatted = formatted[-max_width:] if max_width > 0 else ""
+        if is_min_max or not has_zeros_in_min_part:
+            truncate_to = max_width
 
-    if use_thousands_sep and "*" in mod:
+    return _IntMod(False, min_width, truncate_to, use_thousands_sep and "*" in mod)
+
+
+def _format_int(value: int, mod: str, default_width: int) -> str:
+    spec = _int_mod(mod, default_width)
+    if spec.plain:
+        return str(value)
+
+    formatted = _zfill_signed(value, spec.min_width)
+
+    truncate_to = spec.truncate_to
+    if truncate_to >= 0 and len(formatted) > truncate_to:
+        formatted = formatted[-truncate_to:] if truncate_to > 0 else ""
+
+    if spec.star_group:
         digits_rev = formatted[::-1]
         grouped = []
         for i, c in enumerate(digits_rev):
@@ -390,11 +657,42 @@ def _zfill_signed(value: int, width: int) -> str:
 
 
 def _format_millis(millis: int, mod: str) -> str:
-    width = sum(1 for c in mod if c.isdigit())
-    if width == 0:
-        width = 3
-    scaled = millis // (10 ** (3 - width)) if width <= 3 else millis * (10 ** (width - 3))
-    return str(scaled).zfill(width)
+    """`[f]` -- the reference does NOT treat this as a decimal fraction.
+    It formats the raw millisecond value through the ordinary
+    integer-picture path (jsonata2js `datetime.js:908-910`, whose own
+    comment flags that F&O §9.8.4.5 is unimplemented), so `[f0001]` on
+    1 ms is "0001", not the "0010" a scaled fraction would give.
+
+    A `,min-max` width modifier only ever pads here: `[f1,3-3]` on 1 ms
+    is "001", while `[f1,1-1]` on 123 ms stays "123" rather than being
+    truncated to one digit.
+    """
+    return str(millis).zfill(_millis_width(mod))
+
+
+def _millis_width(mod: str) -> int:
+    if len(mod) > _MAX_CACHEABLE_PICTURE:
+        return _uncached__millis_width(mod)
+    return _cached__millis_width(mod)
+
+
+@lru_cache(maxsize=512)
+def _cached__millis_width(mod: str) -> int:
+    return _uncached__millis_width(mod)
+
+
+def _uncached__millis_width(mod: str) -> int:
+    if not mod:
+        return 0
+    digits_part, _, width_part = mod.partition(",")
+    width = sum(1 for c in digits_part if c.isdigit() and c != "1") or 0
+    if "0" in digits_part:
+        width = sum(1 for c in digits_part if c.isdigit())
+    if width_part:
+        lo = re.match(r"(\d+)", width_part)
+        if lo:
+            width = max(width, int(lo.group(1)))
+    return width
 
 
 def _format_ordinal_suffix(n: int) -> str:

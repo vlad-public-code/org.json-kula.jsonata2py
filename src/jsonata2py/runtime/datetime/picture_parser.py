@@ -27,13 +27,29 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from datetime import date as _date
 from datetime import timezone as _tz
-from typing import Any
+from functools import lru_cache
+from typing import Any, NamedTuple
 
 from ...errors import _RuntimeEvaluationError as RuntimeEvaluationError
 from .. import context as _ctx
+from . import epoch as _epoch
 from . import roman as _roman
 from . import word_numbers as _words
 from .picture_formatter import _DAY_NAMES_FULL, _DAY_NAMES_SHORT, _MONTH_NAMES_FULL, _MONTH_NAMES_SHORT, check_brackets
+
+# A picture string (and therefore any modifier sliced out of it) can come
+# from input data -- `$fromMillis(t, doc.pic)` -- so its length is
+# caller-controlled. lru_cache's maxsize bounds the ENTRY COUNT, not the
+# memory those entries retain: measured on an equivalent cache, 60 distinct
+# 200 KB pictures held 12.3 MB, and a full 256-entry cache of them ~51 MB.
+# A real picture is tens of characters, so anything longer is simply not
+# cached -- identical result, slower, O(1) memory.
+_MAX_CACHEABLE_PICTURE = 256
+
+# Separate, far looser bound on the COMPILED pattern a picture expands to.
+# See _uncached__build_regex: this is the one place a picture escapes into
+# the stdlib's own regex cache, which bounds entries but not their size.
+_MAX_REGEX_CHARS = 8192
 
 _GMT_PATTERN = re.compile(r"GMT([+-])(\d{1,2})(?::(\d{2}))?")
 _BARE_OFFSET = re.compile(r" ([+-])(\d{2})(\d{2})$")
@@ -57,13 +73,89 @@ _MONTH_ABBREVS = {"C", "JA", "FE", "MA", "AP", "MY", "JN", "JL", "AU", "SE", "OC
 # =============================================================================
 
 
+class _PicInfo(NamedTuple):
+    """Everything `parse` needs that depends only on the picture string.
+
+    Each field is a bool, so the whole thing is immutable and holds no
+    per-evaluation state (no timezone, no clock snapshot, no bindings): the
+    parsed timestamp, the zone and "today" are all resolved per call, further
+    down in `_reconstruct_millis`.
+    """
+
+    # _preprocess
+    strip_ordinal_tail: bool
+    roman_month: bool
+    month_letters: bool
+    needs_day_words: bool
+    year_words_or_roman: bool
+    convert_leading_day_letter: bool
+    # parse
+    day_of_year_in_words: bool
+    # _reconstruct_millis
+    iso_week_component: bool
+    time_without_hours: bool
+    day_without_month: bool
+    has_date: bool
+    has_time: bool
+
+
+def _picture_info(picture: str) -> _PicInfo:
+    if len(picture) > _MAX_CACHEABLE_PICTURE:
+        return _uncached__picture_info(picture)
+    return _cached__picture_info(picture)
+
+
+@lru_cache(maxsize=256)
+def _cached__picture_info(picture: str) -> _PicInfo:
+    return _uncached__picture_info(picture)
+
+
+def _uncached__picture_info(picture: str) -> _PicInfo:
+    """The ~20 substring and regex probes `parse` makes against the picture,
+    hoisted out of the per-call path.
+
+    Memoized because the picture is a compile-time literal at essentially
+    every `$toMillis` call site; jsonata2js re-derives the equivalent state on
+    every call (`datetime.js:884` says so: `// TODO can cache this against the
+    picture`). D3135 escapes the cache, since `lru_cache` does not memoise
+    exceptions -- which is what we want: it stays raised on every call.
+
+    Nothing that can raise a *later* error code is hoisted in here: D3132 and
+    D3133 stay in `_build_regex` and D3136 stays in `_reconstruct_millis`, so
+    the order in which competing errors surface is unchanged.
+    """
+    check_brackets(picture)
+    lower = picture.lower()
+    return _PicInfo(
+        strip_ordinal_tail="[D" in picture and "o" in picture,
+        roman_month="[Mi]" in picture,
+        month_letters="[MA]" in picture and "[M01]" not in picture,
+        needs_day_words=_needs_day_word_conversion(picture),
+        year_words_or_roman=_has_year_words_or_roman(picture),
+        convert_leading_day_letter="[DW]" not in picture,
+        day_of_year_in_words="[dwo]" in lower or "[dwwo]" in lower,
+        iso_week_component="[X]" in picture or "[x]" in picture or "[W]" in picture,
+        time_without_hours=("[m]" in picture or "[s]" in picture)
+        and not ("[h" in picture or "[H]" in picture),
+        day_without_month="[Y" in picture
+        and "[D]" in picture
+        and re.search(r"\[M(?!m)[^\]]*\]", picture) is None
+        and not ("[d]" in lower and "[D]" not in picture),
+        has_date=("[Y" in picture and "]" in picture)
+        or ("[M" in picture and "[m" not in picture and "[MA]" not in picture)
+        or "[d" in lower
+        or "[F]" in picture,
+        has_time="[h" in lower or "[m]" in lower or "[s]" in lower,
+    )
+
+
 def parse(timestamp: str, picture: str) -> int | None:
     """Returns epoch millis, or None when the input does not match the
     picture (JSONata's "undefined result" for $toMillis)."""
-    check_brackets(picture)
+    info = _picture_info(picture)
 
     _compute_day_words_converted(picture)
-    processed = _preprocess(timestamp, picture)
+    processed = _preprocess(timestamp, picture, info)
     regex, field_order = _build_regex(picture)  # may raise D3132/D3133/D3136
 
     m = regex.fullmatch(processed)
@@ -72,14 +164,13 @@ def parse(timestamp: str, picture: str) -> int | None:
 
     fields = _extract_fields(m, field_order)
 
-    lower_pic = picture.lower()
-    if ("[dwo]" in lower_pic or "[dwwo]" in lower_pic) and "day_of_year" in fields:
+    if info.day_of_year_in_words and "day_of_year" in fields:
         year = fields.get("year", 1)
         date = _date(year, 1, 1) + timedelta(days=fields["day_of_year"] - 1)
         naive = datetime(date.year, date.month, date.day, tzinfo=UTC)
-        return round(naive.timestamp() * 1000)
+        return _epoch.to_millis(naive)
 
-    return _reconstruct_millis(fields, picture)
+    return _reconstruct_millis(fields, info)
 
 
 # =============================================================================
@@ -87,33 +178,11 @@ def parse(timestamp: str, picture: str) -> int | None:
 # =============================================================================
 
 
-def _reconstruct_millis(fields: dict[str, Any], picture: str) -> int | None:
-    has_iso_week_year = "[X]" in picture or "[x]" in picture
-    has_iso_week = "[W]" in picture
-    if has_iso_week_year or has_iso_week:
+def _reconstruct_millis(fields: dict[str, Any], info: _PicInfo) -> int | None:
+    # The three D3136 rules stay here rather than in `_picture_info`: they must
+    # only fire once the input has actually matched the picture.
+    if info.iso_week_component or info.time_without_hours or info.day_without_month:
         raise RuntimeEvaluationError("D3136", "Date/time underspecified")
-
-    has_hours = "[h" in picture or "[H]" in picture
-    has_minutes = "[m]" in picture
-    has_seconds = "[s]" in picture
-    if (has_minutes or has_seconds) and not has_hours:
-        raise RuntimeEvaluationError("D3136", "Date/time underspecified")
-
-    has_year = "[Y" in picture
-    has_month = re.search(r"\[M(?!m)[^\]]*\]", picture) is not None
-    has_day_month = "[D]" in picture
-    has_day_year = "[d]" in picture.lower() and "[D]" not in picture
-    if has_year and has_day_month and not has_month and not has_day_year:
-        raise RuntimeEvaluationError("D3136", "Date/time underspecified")
-
-    picture_has_date = (
-        ("[Y" in picture and "]" in picture)
-        or ("[M" in picture and "[m" not in picture and "[MA]" not in picture)
-        or "[d" in picture.lower()
-        or "[F]" in picture
-    )
-    lp = picture.lower()
-    picture_has_time = "[h" in lp or "[m]" in lp or "[s]" in lp
 
     hour = fields.get("hour24")
     if hour is None:
@@ -129,15 +198,15 @@ def _reconstruct_millis(fields: dict[str, Any], picture: str) -> int | None:
     millis = fields.get("millis", 0)
     zone = fields.get("tz", UTC)
 
-    if not picture_has_date:
-        if not picture_has_time:
+    if not info.has_date:
+        if not info.has_time:
             return None
         # "Today" comes from the evaluation clock, not the wall clock: $now
         # and $millis are deliberately frozen at the start of an evaluation,
         # so reading datetime.now() here could put a time-only parse on a
         # different date than $now reports when an evaluation straddles
         # midnight. Falls back to wall-clock time outside an evaluation.
-        today = datetime.fromtimestamp(_ctx.evaluation_millis() / 1000.0, UTC).date()
+        today = _epoch.to_datetime(_ctx.evaluation_millis()).date()
         naive = datetime(today.year, today.month, today.day, hour, minute, second, millis * 1000)
         return _to_epoch_millis(naive, zone)
 
@@ -156,8 +225,9 @@ def _reconstruct_millis(fields: dict[str, Any], picture: str) -> int | None:
 
 
 def _to_epoch_millis(naive: datetime, zone: _tz) -> int:
-    aware = naive.replace(tzinfo=zone)
-    return round(aware.timestamp() * 1000)
+    # _epoch, not datetime.timestamp(): the platform routine behind it
+    # rejects pre-1970 instants on Windows.
+    return _epoch.to_millis(naive.replace(tzinfo=zone))
 
 
 # =============================================================================
@@ -165,24 +235,24 @@ def _to_epoch_millis(naive: datetime, zone: _tz) -> int:
 # =============================================================================
 
 
-def _preprocess(timestamp: str, picture: str) -> str:
+def _preprocess(timestamp: str, picture: str, info: _PicInfo) -> str:
     result = _strip_gmt(timestamp)
     result = _normalize_offset(result)
-    if "[D" in picture and "o" in picture:
+    if info.strip_ordinal_tail:
         result = _ORDINAL_TAIL.sub(r"\1", result)
-    if "[Mi]" in picture:
+    if info.roman_month:
         result = _convert_roman_month(result)
-    if "[MA]" in picture and "[M01]" not in picture:
+    if info.month_letters:
         result = _convert_month_letters(result)
 
-    needs_day_words = _needs_day_word_conversion(picture)
+    needs_day_words = info.needs_day_words
     if needs_day_words:
         result = _convert_day_words(result, picture)
 
-    if _has_year_words_or_roman(picture):
+    if info.year_words_or_roman:
         result = _convert_year_part(result, picture, needs_day_words)
 
-    if "[DW]" not in picture:
+    if info.convert_leading_day_letter:
         parts = result.split()
         if parts and len(parts[0]) <= 2 and not parts[0].isdigit():
             up = parts[0].upper()
@@ -244,6 +314,20 @@ def _needs_day_word_conversion(picture: str) -> bool:
 
 
 def _compute_day_words_converted(picture: str) -> bool:
+    if len(picture) > _MAX_CACHEABLE_PICTURE:
+        return _uncached__compute_day_words_converted(picture)
+    return _cached__compute_day_words_converted(picture)
+
+
+@lru_cache(maxsize=256)
+def _cached__compute_day_words_converted(picture: str) -> bool:
+    return _uncached__compute_day_words_converted(picture)
+
+
+def _uncached__compute_day_words_converted(picture: str) -> bool:
+    # `parse` calls this and discards the result; it is pure, so the call is a
+    # no-op, but it is left in place (memoized, so it costs one dict probe)
+    # rather than removed as part of a caching change.
     return (
         "[DWwo]" in picture
         or "[dwo" in picture.lower()
@@ -405,8 +489,11 @@ def _letter_to_day(letter: str) -> int:
 # =============================================================================
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class _FieldSpec:
+    """A parsed picture component. Frozen because `_build_regex` caches these
+    and hands the same instances to every subsequent `$toMillis` call."""
+
     kind: str
     regex_exact: str
     regex_greedy: str
@@ -556,7 +643,26 @@ def _tokenize(picture: str) -> list[tuple[str, str] | tuple[str, str, str]]:
     return tokens
 
 
-def _build_regex(picture: str) -> tuple[re.Pattern[str], list[tuple[str, _FieldSpec]]]:
+def _build_regex(picture: str) -> tuple[re.Pattern[str], tuple[tuple[str, _FieldSpec], ...]]:
+    if len(picture) > _MAX_CACHEABLE_PICTURE:
+        return _uncached__build_regex(picture)
+    return _cached__build_regex(picture)
+
+
+@lru_cache(maxsize=256)
+def _cached__build_regex(picture: str) -> tuple[re.Pattern[str], tuple[tuple[str, _FieldSpec], ...]]:
+    return _uncached__build_regex(picture)
+
+
+def _uncached__build_regex(picture: str) -> tuple[re.Pattern[str], tuple[tuple[str, _FieldSpec], ...]]:
+    """Compiles the picture into one regex plus the group -> component map.
+
+    Memoized: this is the single most expensive step of `$toMillis`, it is
+    pure in the picture string, and both the compiled pattern and the frozen
+    `_FieldSpec`s it hands out are immutable. D3132, D3133, D3135 and the
+    `[x]`/`[w]` D3136 escape the cache, since `lru_cache` does not memoise
+    exceptions -- which is what we want: they stay raised on every call.
+    """
     tokens = _tokenize(picture)
     specs: list[_FieldSpec | None] = [
         _field_spec(tok[1], tok[2]) if len(tok) == 3 and tok[0] == "field" else None for tok in tokens
@@ -588,10 +694,21 @@ def _build_regex(picture: str) -> tuple[re.Pattern[str], list[tuple[str, _FieldS
         i = j
 
     pattern = "".join(parts)
-    return re.compile(pattern, re.IGNORECASE), field_order
+    if len(pattern) > _MAX_REGEX_CHARS:
+        # The only place a picture string becomes a COMPILED REGEX, and so
+        # the only place its size escapes this module's own caches:
+        # `re.compile` populates the stdlib's `re._cache`, which is bounded
+        # at 512 ENTRIES but not by their size. Measured, 40 pictures of
+        # 200 KB left 64 MB in that cache -- ~800 MB at its entry limit --
+        # even though every cache in this file correctly declined them.
+        # A picture is a format specification; the longest in the entire
+        # acceptance suite is 57 characters, so a pattern beyond this
+        # bound cannot be a real one and is rejected rather than compiled.
+        raise RuntimeEvaluationError("D3135", "$toMillis: picture string is too long")
+    return re.compile(pattern, re.IGNORECASE), tuple(field_order)
 
 
-def _extract_fields(m: re.Match[str], field_order: list[tuple[str, _FieldSpec]]) -> dict[str, Any]:
+def _extract_fields(m: re.Match[str], field_order: tuple[tuple[str, _FieldSpec], ...]) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     for gname, spec in field_order:
         text = m.group(gname)

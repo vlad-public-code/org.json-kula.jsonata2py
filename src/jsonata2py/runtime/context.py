@@ -111,6 +111,25 @@ class _Frame:
         self.suspended = suspended
 
 
+# A process-wide stack of the deadlines currently installed by *any*
+# thread or task, mirroring jsonata2js's `lambda.js#_deadlineStack`. It
+# exists purely as a cheap negative gate: reading `if not
+# DEADLINE_STACK:` is one global load plus one truthiness test, where
+# the authoritative per-context answer (`has_deadline()`) costs a
+# function call plus a ContextVar lookup plus two attribute loads --
+# ~160 ns paid on every callback-taking runtime helper even when no
+# caller has ever set a timeout.
+#
+# Non-empty never *asserts* that this context has a deadline, so a
+# concurrent timed evaluation in another thread only costs untimed
+# evaluations the slow path they used to take unconditionally; empty is
+# authoritative because a deadline is pushed before any generated code
+# can observe it and popped in EvalState.end's finally-driven caller.
+# list.append/pop are atomic, and every push is matched by exactly one
+# pop, so the length never drifts.
+DEADLINE_STACK: list[float] = []
+
+
 class EvalState:
     """All per-evaluation context-local state in one mutable container.
     Reused across evaluate() calls within the same context to avoid
@@ -146,7 +165,8 @@ class EvalState:
         timeout_ms: int,
         eval_delegate: Any,
     ) -> None:
-        if self.active:
+        nested = self.active
+        if nested:
             # Nested evaluation: suspend the enclosing one rather than
             # overwriting it. The inner evaluation gets its own recursion
             # budget, restored on the way out.
@@ -163,11 +183,24 @@ class EvalState:
             self.pending_tail_call = None
         self.active = True
         self.bindings = bindings
-        self.millis = millis
-        self.timeout_deadline = time.monotonic() + timeout_ms / 1000.0 if timeout_ms > 0 else None
+        # $now/$millis are frozen for the whole top-level evaluation, and
+        # a nested $eval is part of that same evaluation -- so it INHERITS
+        # the outer snapshot instead of taking a fresh one. Otherwise
+        # `$eval("$millis()") = $millis()` could be false, which the
+        # reference guarantees true (jsonata2js keeps the same invariant
+        # by having $eval reuse clock.js's pushed snapshot rather than
+        # calling createClock itself).
+        if not nested:
+            self.millis = millis
+        deadline = time.monotonic() + timeout_ms / 1000.0 if timeout_ms > 0 else None
+        self.timeout_deadline = deadline
+        if deadline is not None:
+            DEADLINE_STACK.append(deadline)
         self.eval_delegate = eval_delegate
 
     def end(self) -> None:
+        if self.timeout_deadline is not None:
+            DEADLINE_STACK.pop()
         outer = self.suspended
         if outer is not None:
             self.suspended = outer.suspended
@@ -181,6 +214,9 @@ class EvalState:
         self.active = False
         self.bindings = None
         self.eval_delegate = None
+        # Cleared so a stray second end() cannot pop a deadline this
+        # state no longer owns; has_deadline() gates on `active` anyway.
+        self.timeout_deadline = None
         if self.call_depth is not None:
             self.call_depth[0] = 0
         if self.pending_tail_call is not None:
@@ -244,6 +280,8 @@ def is_active() -> bool:
 
 
 def has_deadline() -> bool:
+    if not DEADLINE_STACK:
+        return False
     s = _current()
     return s.active and s.timeout_deadline is not None
 
@@ -251,6 +289,8 @@ def has_deadline() -> bool:
 def check_timeout() -> None:
     """Raises U1001 if the current evaluation has exceeded its deadline.
     No-op when no timeout is set."""
+    if not DEADLINE_STACK:
+        return
     s = _current()
     if s.active and s.timeout_deadline is not None and time.monotonic() > s.timeout_deadline:
         raise RuntimeEvaluationError("U1001", "Expression evaluation timeout")

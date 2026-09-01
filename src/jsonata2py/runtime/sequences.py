@@ -34,6 +34,21 @@ def fn_sort(arg: Any, key_fn: Callable[[Any], Any] | None) -> Any:
                     "D3070", "$sort() cannot sort arrays of objects without a comparator function"
                 )
 
+    # Which error a bad key reports depends on which construct called in:
+    # `$sort(arr)` with no comparator reports D3070 ("cannot sort"),
+    # while the `^(key)` order-by operator reports T2007/T2008 about its
+    # key expression. key_fn is None for exactly the former.
+    if key_fn is None:
+        bad_type_code, bad_type_msg = "D3070", "$sort() argument must be an array of strings or numbers"
+        mixed_code, mixed_msg = "D3070", "$sort() cannot sort an array of mixed types without a comparator function"
+    else:
+        bad_type_code = "T2008"
+        bad_type_msg = "The key expression in the order-by clause must evaluate to a string or a number"
+        mixed_code = "T2007"
+        mixed_msg = (
+            "The items in the order-by clause must evaluate to a single type, either all string or all number"
+        )
+
     keys: list[Any] = [MISSING] * len(items)
     has_number = False
     has_string = False
@@ -45,22 +60,16 @@ def fn_sort(arg: Any, key_fn: Callable[[Any], Any] | None) -> Any:
             continue
         if k is None:
             # JSON null is not a valid sort key.
-            raise RuntimeEvaluationError(
-                "T2008", "The key expression in the order-by clause must evaluate to a string or a number"
-            )
+            raise RuntimeEvaluationError(bad_type_code, bad_type_msg)
         if _core.is_number(k):
             has_number = True
         elif isinstance(k, str):
             has_string = True
         else:
-            raise RuntimeEvaluationError(
-                "T2008", "The key expression in the order-by clause must evaluate to a string or a number"
-            )
+            raise RuntimeEvaluationError(bad_type_code, bad_type_msg)
         keys[i] = k
     if has_number and has_string:
-        raise RuntimeEvaluationError(
-            "T2007", "The items in the order-by clause must evaluate to a single type, either all string or all number"
-        )
+        raise RuntimeEvaluationError(mixed_code, mixed_msg)
 
     # Keys are already extracted and validated to be all-number or
     # all-string; a native key-sort is a direct translation of cmp's rules
@@ -251,7 +260,9 @@ def fn_filter(arr: Any, predicate: Callable[[Any], Any]) -> Any:
 def fn_reduce(arr: Any, fn: Callable[[Any], Any], init: Any) -> Any:
     fn = _core.deadline_guard(fn)
     if arr is MISSING:
-        return init
+        # An absent sequence is absent regardless of `init`: the
+        # reference returns undefined, not the initial accumulator.
+        return MISSING
     items = list(arr) if isinstance(arr, list) else [arr]
     if init is MISSING:
         if not items:

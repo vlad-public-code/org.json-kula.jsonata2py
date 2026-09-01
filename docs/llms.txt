@@ -8,10 +8,11 @@ sitemap: false
 > jsonata2py is a Python 3.11+ library that translates [JSONata](https://jsonata.org)
 > expressions into native Python source at runtime. Each expression is parsed, optimised,
 > translated to Python source, compiled in-memory (`compile()` + `exec()`), and returned as a
-> ready-to-call, thread-safe `CompiledExpression`. Measured ~26x faster evaluation than the
-> pure-Python reference interpreter (`jsonata-python`), and faster than both Rust-backed
-> alternatives (`jsonatapy`, `jsonata-rs`) when querying Python objects directly, on a
-> realistic analytical benchmark. All 1,281 files of the official JSONata test suite pass.
+> ready-to-call, thread-safe `CompiledExpression`. Measured ~47x faster evaluation than the
+> pure-Python reference interpreter (`jsonata-python`), and ~2x-4x faster than both
+> Rust-backed alternatives (`jsonatapy`, `jsonata-rs`) — including on JSON text in, JSON
+> text out — on a realistic analytical benchmark. All 1,281 files of the official JSONata
+> test suite pass.
 > MIT licensed.
 
 Use it when you evaluate the same JSONata expression many times and want compiled-source
@@ -48,13 +49,6 @@ Key facts:
 - [Performance]({{ '/#performance' | absolute_url }}): measured throughput vs `jsonata-python` and `jsonatapy`, and how to reproduce it.
 - [Architecture]({{ '/#architecture-overview' | absolute_url }}): the pipeline and package structure (`parser`, `optimizer`, `translator`, `runtime`, `loader`).
 - [Source on GitHub]({{ site.github.repository_url }}): code and README. MIT licensed.
-
-## Built-in function references
-
-- [Numeric functions]({{ '/numeric.md' | absolute_url }}): implementation notes for `$number`, `$round`, `$random`, `$formatBase`, `$formatNumber`, `$formatInteger`, `$parseInteger`.
-- [String functions]({{ '/string.md' | absolute_url }}): implementation notes for `$string*`, `$length`, `$substring*`, `$match`, `$replace`, `$split`, `$join`, `$pad`, `$base64*`, `$encodeUrl*`, and more.
-- [Date/time functions]({{ '/datetime.md' | absolute_url }}): implementation notes for `$now`, `$millis`, `$fromMillis`, `$toMillis`, including XPath/XQuery picture-string formatting and parsing.
-- [Function-library design]({{ '/design/function-library.md' | absolute_url }}): the design behind `compile_library` — how a JSONata definition expression becomes a set of callable, exportable functions.
 
 ## Related projects
 
