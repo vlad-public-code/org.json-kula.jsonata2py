@@ -60,8 +60,13 @@ from ..parser.ast_nodes import (
     SortExpr,
     WildcardStep,
     accept,
+    array_ctor_always_yields_value,
+    consarray_path_head,
+    consarray_sub_path,
+    staged_consarray_head,
 )
 from ..parser.parser import BUILTIN_NAMES
+from . import scan_fusion, tuple_path_codegen
 from .gen_state import emit_callback
 from .naming import py_string, pyvar
 
@@ -81,6 +86,14 @@ def _pair_idx_expr(pair_var: str) -> str:
 def visit_path_expr(t: Translator, n: PathExpr, ctx: GenCtx) -> str:
     steps = list(n.steps)
 
+    if tuple_path_codegen.path_needs_tuples(steps):
+        # `@$v`/`#$v` need the reference's tuple stream: a binding step emits
+        # one output per (input item x step result) carrying both the binding
+        # and the *unchanged* context, which mapping over a collected sequence
+        # of bare values cannot express. See runtime/tuples.py.
+        keep = any(step_carries_live_mark(s) for s in steps)
+        return tuple_path_codegen.visit_tuple_path(t, PathExpr(steps), ctx, keep)
+
     # Each PathExpr is a fresh path scope: clear any inherited cross-join
     # context so sub-paths inside constructors/predicates don't reuse an
     # outer cross-join base.
@@ -92,6 +105,15 @@ def visit_path_expr(t: Translator, n: PathExpr, ctx: GenCtx) -> str:
         first_step = first_step.source
     if not force_arr and isinstance(first_step, PredicateExpr) and isinstance(first_step.source, ForceArray):
         force_arr = True
+
+    if force_arr and path_ends_with_constructor_step(first_step):
+        # `a.[1][].$` -- the `[]` wraps a path whose value is a constructor's
+        # own array, so the promotion belongs inside the step helper, exactly
+        # as visit_force_array arranges it for the un-stepped `a.[1][]`.
+        # Wrapping the finished result instead would see a plain list and
+        # pass it through.
+        ctx = ctx.with_array_constructor_preserve()
+        force_arr = False
 
     if force_arr and isinstance(first_step, PathExpr) and _has_any_binding(first_step.steps) and len(steps) > 1:
         merged_steps = [*first_step.steps, *steps[1:]]
@@ -156,10 +178,57 @@ def visit_path_expr(t: Translator, n: PathExpr, ctx: GenCtx) -> str:
                 idx_expr = accept(hoist_as.index, t, ctx)
                 return f"subscript({inner_result}, {idx_expr})"
 
-    result = _compile_path_steps(t, steps, start_from, expr, ctx)
+    if len(steps) > 1 and staged_consarray_head(first_step) is not None:
+        head_var = f"_sh{ctx.state.next_id()}"
+        rest = _compile_path_steps(t, steps, start_from, head_var, ctx)
+        result = f"staged_consarray_head({expr}, lambda {head_var}: {rest})"
+        return f"force_array({result})" if force_arr else result
+
+    head_ctor = consarray_path_head(first_step) if len(steps) > 1 else None
+    if head_ctor is not None and not head_ctor.elements:
+        # Statically empty: the remaining steps are unreachable at run time,
+        # so `[].x` folds to the constant `[]`. They are still *compiled*,
+        # and the result thrown away, so that a step which cannot be
+        # translated at all still reports it -- `[].%` is S0217 in the
+        # reference too, which resolves `%` ancestry while building the AST
+        # rather than while evaluating.
+        _compile_path_steps(t, steps, start_from, "None", ctx)
+        result = "array_of()"
+    elif head_ctor is not None and not array_ctor_always_yields_value(head_ctor):
+        # Might be empty at run time (`[nope].x`, `[nums[false]].x`) --
+        # guard it, passing the remaining steps as a thunk so they are
+        # skipped rather than evaluated to nothing.
+        head_var = f"_ch{ctx.state.next_id()}"
+        rest = _compile_path_steps(t, steps, start_from, head_var, ctx)
+        result = f"consarray_head({expr}, lambda {head_var}: {rest})"
+    else:
+        # No constructor head, or one that provably yields a value: the
+        # guard could never fire, so emit the ordinary step chain unchanged.
+        result = _compile_path_steps(t, steps, start_from, expr, ctx)
     if _path_ends_with_group_by_after_binding(steps):
         result = f"merge_group_by_objects({result})"
-    return f"force_array({result})" if force_arr else result
+    if not force_arr and any(step_carries_live_mark(s) for s in steps):
+        # The reference flags the *path* when any of its steps carried a
+        # `[]` and reads the flag once at the end, where it suppresses the
+        # length-1 collapse: `nums[][0].$` is `[1]`, because the mark
+        # survives the steps that follow it. Re-wrapping the already
+        # collapsed value is the same thing -- the length-0 collapse is not
+        # guarded by the mark, and has already yielded MISSING.
+        result = f"force_array({result})"
+    if not force_arr:
+        return result
+    # A consarray-headed path can come out as the head's own cons array, and
+    # a `[]` promotes that rather than passing it through: `[][].$` is `[[]]`.
+    return f"force_array_cons({result})" if head_ctor is not None else f"force_array({result})"
+
+
+def step_carries_live_mark(step: AstNode) -> bool:
+    """True if a `[]` written on this step can still promote the path."""
+    if isinstance(step, ForceArray):
+        return step.on_sequence or step_carries_live_mark(step.source)
+    if isinstance(step, (PredicateExpr, ArraySubscript, SortExpr)):
+        return step_carries_live_mark(step.source)
+    return False
 
 
 def _path_ends_with_group_by_after_binding(steps: list[AstNode]) -> bool:
@@ -282,7 +351,30 @@ def _compile_path_steps(t: Translator, steps: list[AstNode], from_: int, prev_ex
         rest_expr = _compile_path_steps(t, steps, from_ + 1, field_expr, inner_ctx)
         return f"map_step({prev_expr}, lambda {dummy_var}: {rest_expr})"
 
-    new_expr = apply_step(t, prev_expr, step, ctx)
+    # A constructor step already collapses its own result, so a `$` following
+    # one must not collapse it a second time -- `one.[$].$` is `[{"x":1}]`.
+    # Only a constructor *step* does this; a constructor at position 0 is the
+    # path head, compiled as a plain value.
+    prev = steps[from_ - 1] if from_ >= 1 else None
+    prev_finalised = (
+        # A constructor at index 0 is the path *head*, compiled as a plain
+        # value, so it has finalised nothing. Anywhere else it is a step and
+        # has. A `[]` on a step whose result is a *sequence* does not count:
+        # that mark is read once at the end of the path
+        # (keepSingletonArray), not at the step, so the step after it still
+        # runs normally and `nested[].$` spreads. A `[]` on a constructor
+        # step is different -- there the promotion happened at the step, and
+        # `a.[1][].$` is `[[1]]`.
+        (
+            isinstance(prev, ForceArray)
+            and (not prev.on_sequence or path_ends_with_constructor_step(prev.source))
+        )
+        or (from_ >= 2 and isinstance(prev, (ArrayConstructor, ObjectConstructor)))
+        or (from_ >= 2 and prev is not None and consarray_sub_path(prev) is not None)
+    )
+    new_expr = apply_step(
+        t, prev_expr, step, ctx, is_last=from_ == len(steps) - 1, prev_is_finalised=prev_finalised
+    )
     return _compile_path_steps(t, steps, from_ + 1, new_expr, ctx)
 
 
@@ -316,9 +408,57 @@ def _needs_parent_tracking(steps: list[AstNode], from_: int, ctx: GenCtx) -> boo
 
 
 def path_ends_with_array_constructor(node: AstNode) -> bool:
-    if isinstance(node, PathExpr):
-        return bool(node.steps) and isinstance(node.steps[-1], ArrayConstructor)
-    return False
+    """True if the path's value is an array constructor's own array.
+
+    Trailing `$` steps are transparent: `$` rebinds the context to itself, so
+    the constructor's array is still what comes out and it is still `cons`.
+    `a.[1].$[]` is `[[1]]`, the same as `a.[1][]`.
+    """
+    if not isinstance(node, PathExpr) or not node.steps:
+        return False
+    steps = node.steps
+    i = len(steps) - 1
+    while i > 0 and isinstance(steps[i], ContextRef):
+        i -= 1
+    return i > 0 and (isinstance(steps[i], ArrayConstructor) or consarray_sub_path(steps[i]) is not None)
+
+
+def path_headed_by_consarray(node: AstNode) -> bool:
+    """True if the path's head is a flagged array constructor.
+
+    Such a path can come out as the head's own `cons` array -- the §1
+    short-circuit returns it whole and the remaining steps never run -- and
+    a cons array is not a sequence, so the collapse does not apply to it and
+    a `[]` mark promotes it rather than passing it through. `[].x[]` is
+    `[[]]` and `[].x^($)` is `[]`, both for the same reason `a.[1][]` is
+    `[[1]]`.
+    """
+    if not isinstance(node, PathExpr) or not node.steps:
+        return False
+    return consarray_path_head(node.steps[0]) is not None
+
+
+def path_ends_with_constructor_step(node: AstNode) -> bool:
+    """The narrower case: the path's last meaningful step is a *bare* array
+    constructor, so the whole result is statically a constructor value and
+    the promotion can be folded into the step helper."""
+    if not isinstance(node, PathExpr) or not node.steps:
+        return False
+    steps = node.steps
+    i = len(steps) - 1
+    while i > 0 and isinstance(steps[i], ContextRef):
+        i -= 1
+    return i > 0 and isinstance(steps[i], ArrayConstructor)
+
+
+def _stage_over_object_constructor(step: AstNode) -> bool:
+    """True for an object constructor carrying a stage, as one path step."""
+    if not isinstance(step, (PredicateExpr, ArraySubscript, ForceArray, SortExpr)):
+        return False
+    inner = step.source
+    while isinstance(inner, (PredicateExpr, ArraySubscript, ForceArray, SortExpr)):
+        inner = inner.source
+    return isinstance(inner, ObjectConstructor)
 
 
 def _step_expr(t: Translator, step: AstNode, ctx: GenCtx) -> str:
@@ -341,7 +481,14 @@ def _step_expr(t: Translator, step: AstNode, ctx: GenCtx) -> str:
     return accept(step, t, ctx)
 
 
-def apply_step(t: Translator, prev_expr: str, step: AstNode, ctx: GenCtx) -> str:
+def apply_step(
+    t: Translator,
+    prev_expr: str,
+    step: AstNode,
+    ctx: GenCtx,
+    is_last: bool = False,
+    prev_is_finalised: bool = False,
+) -> str:
     """Generates an expression that applies step to prev_expr (steps 2+ in
     a path)."""
     if isinstance(step, FieldRef):
@@ -362,7 +509,15 @@ def apply_step(t: Translator, prev_expr: str, step: AstNode, ctx: GenCtx) -> str
     if isinstance(step, DescendantStep):
         return f"descendant({prev_expr})"
     if isinstance(step, ContextRef):
-        return prev_expr
+        # `$` rebinds the context to itself, so the mapping is an identity --
+        # but it is still a *step*, and the reference finalises the sequence
+        # it produces: an element that is a plain array gets spread, so
+        # `nested.$` over `[[1,2],[3]]` is `[1,2,3]`. `[1].$` is `1`, not
+        # `[1]`; `one.[].$` is `[]`, because a constructor's own array is
+        # already finalised and passes through verbatim.
+        if prev_is_finalised:
+            return prev_expr
+        return f"context_step({prev_expr}, {is_last!r})"
     if isinstance(step, RootRef):
         return ctx.root_var
     if isinstance(step, PredicateExpr):
@@ -371,8 +526,30 @@ def apply_step(t: Translator, prev_expr: str, step: AstNode, ctx: GenCtx) -> str
             to_expr = accept(step.predicate.to, t, ctx)
             return f"range_subscript({prev_expr}, {from_expr}, {to_expr})"
         pred = step.predicate
+        if not isinstance(step.source, ContextRef):
+            # The step carries its own source (`objs.t[[0]]` folds the
+            # predicate onto `t`), so navigate it per element and filter
+            # *that* -- the same shape the subscript branch below uses. The
+            # ContextRef case is the fold-onto-position form, where the
+            # incoming stream already is the thing to filter.
+            src_node = step.source
+
+            def build_pred(v: str) -> str:
+                inner = ctx.with_ctx(v)
+                src = accept(src_node, t, inner)
+                inner_cb = emit_callback(pred, ctx, "_el", lambda w: accept(pred, t, inner.with_ctx(w)))
+                return f"dynamic_filter({src}, {inner_cb})"
+
+            return f"map_step({prev_expr}, {emit_callback(step, ctx, '_c', build_pred)})"
         cb = emit_callback(pred, ctx, "_el", lambda v: accept(pred, t, ctx.with_ctx(v)))
         return f"dynamic_filter({prev_expr}, {cb})"
+    if _stage_over_object_constructor(step):
+        # `nested.{"k":$}[0]`: the parser folds the stage onto the
+        # constructor step, so the step is no longer an ObjectConstructor and
+        # the group fold above was lost. The fold belongs to the constructor
+        # whatever is wrapped around it.
+        cb = emit_callback(step, ctx, "_c", lambda v: accept(step, t, ctx.with_ctx(v)))
+        return f"unwrap(map_group_step({prev_expr}, {cb}))"
     if isinstance(step, ArraySubscript):
         sub: ArraySubscript = step
 
@@ -386,8 +563,14 @@ def apply_step(t: Translator, prev_expr: str, step: AstNode, ctx: GenCtx) -> str
         cb = emit_callback(
             arr, ctx, "_c", lambda v: accept(arr, t, ctx.with_ctx(v).with_in_array_constructor_step())
         )
-        call = f"map_constructor_step({prev_expr}, {cb})"
-        return call if ctx.array_constructor_preserve else f"unwrap({call})"
+        # A constructor step's result is a `cons` value: never flattened, and
+        # collapsed only across a *sequence* of them. `unwrap` conflated the
+        # two, so a non-sequence context lost the array (`a.[1]` became `1`).
+        # Under a `[]` wrapper the cons value is promoted instead of passed
+        # through -- see constructor_step_keep_singleton.
+        if ctx.array_constructor_preserve:
+            return f"constructor_step_keep_singleton({prev_expr}, {cb})"
+        return f"constructor_step_final({prev_expr}, {cb})"
     if isinstance(step, ObjectConstructor):
         if ctx.tuple_pos is not None:
             # tuple_pos carries the *raw JSONata* variable name (e.g. "pos",
@@ -406,10 +589,19 @@ def apply_step(t: Translator, prev_expr: str, step: AstNode, ctx: GenCtx) -> str
                 step_expr = accept(step, t, ctx.with_ctx(t_elem_expr).with_tuple_pos(None))
             finally:
                 ctx.state.pop_scope()
-            return f"unwrap(map_constructor_step({prev_expr}, lambda {tmp_tuple}: {step_expr}))"
+            return f"unwrap(map_group_step({prev_expr}, lambda {tmp_tuple}: {step_expr}))"
         obj: ObjectConstructor = step
         cb = emit_callback(obj, ctx, "_c", lambda v: accept(obj, t, ctx.with_ctx(v)))
-        return f"unwrap(map_constructor_step({prev_expr}, {cb}))"
+        return f"unwrap(map_group_step({prev_expr}, {cb}))"
+    if isinstance(step, PathExpr) and consarray_sub_path(step) is not None:
+        # A sub-path led by a possibly-empty array constructor, which the
+        # optimizer deliberately left unflattened. When its head
+        # short-circuits it yields a constructor value, not a sequence, so
+        # the parent steps over it without flattening -- see
+        # map_consarray_step.
+        subpath: PathExpr = step
+        cb = emit_callback(subpath, ctx, "_c", lambda v: visit_path_expr(t, subpath, ctx.with_ctx(v)))
+        return f"map_consarray_step({prev_expr}, {cb})"
     if isinstance(step, GroupByExpr) and isinstance(step.source, ContextRef):
         # GroupByExpr(ContextRef) appears as a path step only after Rule D's
         # binding rewrite. It must receive the whole accumulated sequence,
@@ -428,7 +620,8 @@ def apply_step(t: Translator, prev_expr: str, step: AstNode, ctx: GenCtx) -> str
             inner = inner.with_parents([outer_parent])
         return accept(tail, t, inner)
 
-    return f"map_step({prev_expr}, {emit_callback(tail, ctx, '_c', build_step)})"
+    mapper = "step_final" if is_last else "map_step"
+    return f"{mapper}({prev_expr}, {emit_callback(tail, ctx, '_c', build_step)})"
 
 
 _STATIC_BOOLEAN_OPS = {"=", "!=", "<", ">", "<=", ">=", "in", "and", "or"}
@@ -450,6 +643,10 @@ def _is_static_boolean_predicate(node: AstNode) -> bool:
 
 
 def visit_predicate_expr(t: Translator, n: PredicateExpr, ctx: GenCtx) -> str:
+    # A filter the block's scan-fusion pass absorbed reads its slot instead.
+    fused_slot = ctx.state.scan_slot(n)
+    if fused_slot is not None:
+        return fused_slot
     source_node = n.source
     force_arr = isinstance(source_node, ForceArray)
     if isinstance(source_node, ForceArray):
@@ -460,7 +657,7 @@ def visit_predicate_expr(t: Translator, n: PredicateExpr, ctx: GenCtx) -> str:
         if isinstance(last_step, (PositionBinding, ContextBinding)):
             new_steps = [*source_node.steps, PredicateExpr(ContextRef(), n.predicate)]
             new_source: AstNode = PathExpr(new_steps)
-            wrapped: AstNode = ForceArray(new_source) if force_arr else new_source
+            wrapped: AstNode = ForceArray(new_source, True) if force_arr else new_source
             return accept(wrapped, t, ctx)
 
     if isinstance(n.predicate, RangeExpr):
@@ -497,8 +694,17 @@ def visit_predicate_expr(t: Translator, n: PredicateExpr, ctx: GenCtx) -> str:
             result = accept(PathExpr(new_steps), t, ctx)
             return f"force_array({result})" if force_arr else result
 
-    src_expr = accept(source_node, t, ctx)
     pred = n.predicate
+    literal = scan_fusion.field_eq_literal(pred)
+    if literal is not None:
+        # `$seq[field = <literal>]` -- the value-producing twin of
+        # $count(seq[field = literal]), monomorphized in the runtime rather
+        # than reached through a per-element callback.
+        name, lit_source, _ = literal
+        r = f"filter_field_eq({accept(source_node, t, ctx)}, {py_string(name)}, {lit_source})"
+        return f"force_array({r})" if force_arr else r
+
+    src_expr = accept(source_node, t, ctx)
     cb = emit_callback(pred, ctx, "_el", lambda v: accept(pred, t, ctx.with_ctx(v)))
     filter_fn = "filter_" if _is_static_boolean_predicate(pred) else "dynamic_filter"
     r = f"{filter_fn}({src_expr}, {cb})"

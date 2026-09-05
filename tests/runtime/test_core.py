@@ -221,8 +221,18 @@ class TestSequenceHOF:
         assert e.value.error_code == "T2007"
 
         with pytest.raises(RuntimeEvaluationError) as e:
-            seq.fn_sort([{"k": True}], lambda item: item["k"])
+            seq.fn_sort([{"k": True}, {"k": False}], lambda item: item["k"])
         assert e.value.error_code == "T2008"
+
+    def test_a_lone_element_is_never_compared(self) -> None:
+        """The reference merge-sorts, so with nothing to compare it never
+        evaluates a key and never reports a bad one -- `[{"k":true}]^(k)` is
+        the object, not T2008, and `$sort([[1]])` is `[[1]]`, not D3070."""
+        from jsonata2py.runtime import sequences as seq
+
+        assert seq.fn_sort([{"k": True}], lambda item: item["k"]) == [{"k": True}]
+        assert seq.fn_sort([[1]], None) == [[1]]
+        assert seq.fn_sort([{"k": 1}], None) == [{"k": 1}]
 
 
 class TestLambdaValuesAndApply:

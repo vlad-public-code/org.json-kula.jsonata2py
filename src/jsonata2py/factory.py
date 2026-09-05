@@ -59,11 +59,11 @@ _EVAL_CACHE_MAX_BYTES = 1 << 20
 # Tier 2 (_code_cache) is what catches the case tier 1 structurally
 # cannot: a long-lived process that compiles an expression, uses it,
 # drops it, and meets the same text again later. Measured, that fell all
-# the way back to a full recompile (~7.7ms). A *code object* references
-# neither a module namespace nor a CompiledExpression, so holding one
-# strongly cannot keep a generated module alive and does not touch the
-# contract above; re-executing it into a fresh namespace costs ~40us
-# rather than 7.7ms. Bounded separately and more tightly than tier 1,
+# the way back to a full recompile (~10.5ms on the benchmark expression).
+# A *code object* references neither a module namespace nor a
+# CompiledExpression, so holding one strongly cannot keep a generated
+# module alive and does not touch the contract above; re-executing it
+# into a fresh namespace costs ~15us rather than ~10.5ms. Bounded separately and more tightly than tier 1,
 # because a code object for a large expression retains ~40 KiB.
 # Tier 1's values are weakrefs (cheap), but its KEYS are the expression
 # text, so it is byte-bounded for the same reason.

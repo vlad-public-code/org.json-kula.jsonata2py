@@ -69,7 +69,6 @@ def _opcount(code, opname: str) -> int:
 
 _HOISTS = [
     pytest.param("items[price > 15].name", id="comparison-predicate"),
-    pytest.param("items[level = 'senior'].name", id="equality-predicate"),
     pytest.param("items[price >= 10 and qty < 5].name", id="and-predicate"),
     pytest.param("items[qty in [1, 2]].name", id="array-literal-predicate"),
     pytest.param("items[$string(id) = '2'].name", id="static-builtin-call"),
@@ -112,7 +111,7 @@ def test_transform_pattern_and_update_callbacks_both_hoist() -> None:
     src = _FACTORY.translate("items ~> |$|{'price': 99}|")
     assert _hoisted_constants(src) == [
         "_fn0 = lambda _p0: _p0",
-        "_fn1 = lambda _p0: object_of(_keys0, [99])",
+        "_fn1 = lambda _p0: object_of_distinct(_keys0, [99])",
     ]
     assert "fn_transform(_ts0, _fn0, _fn1, MISSING)" in src
 
@@ -125,8 +124,18 @@ def test_hoisted_callbacks_use_canonical_parameter_names() -> None:
 
 
 def test_identical_predicates_share_one_hoisted_constant() -> None:
-    src = _FACTORY.translate("items[level = 'senior'].name & items[level = 'senior'].id")
+    src = _FACTORY.translate("items[price > 15].name & items[price > 15].id")
     assert len(_hoisted_constants(src)) == 1, f"expected one shared constant:\n{src}"
+
+
+def test_a_field_equals_literal_predicate_needs_no_callback_at_all() -> None:
+    """Better than hoisting: `field = <literal>` compiles to a direct
+    filter_field_eq call, so there is no lambda to hoist in the first place.
+    That is also what lets a fused scan slot name its own fallback -- the
+    scan has no compiled predicate to hand back."""
+    src = _FACTORY.translate("items[level = 'senior'].name & items[level = 'senior'].id")
+    assert _hoisted_constants(src) == []
+    assert "filter_field_eq" in src
     assert _FACTORY.compile("items[level = 'senior'].name & items[level = 'senior'].id").evaluate(
         _DATA
     ) == "[\"b\",\"c\"][2,3]"
@@ -143,7 +152,21 @@ def test_benchmark_expression_builds_no_closures_per_evaluation() -> None:
     assert "_block0" in codes
     per_evaluation = [c for name, group in codes.items() if name != "<module>" for c in group]
     assert sum(_opcount(c, "MAKE_FUNCTION") for c in per_evaluation) == 0
-    assert len(_hoisted_constants(src)) == 18
+    # Was 18 before `field = <literal>` predicates stopped needing a callback
+    # and sequence-scan fusion absorbed most of the remaining operations.
+    assert len(_hoisted_constants(src)) == 3
+
+
+def test_a_binding_callback_captures_nothing_at_all() -> None:
+    """`@$v`/`#$v` used to reach an evaluator-scope local (`v_i`, `_pair`),
+    which is why their callbacks had to stay inline. Tuple mode carries the
+    binding *on the tuple* instead, so the callback closes over nothing --
+    every name it needs arrives as a parameter."""
+    for expr in ("items@$i[$i.price > 15].name", "items#$p[$p = 2].name"):
+        src = _FACTORY.translate(expr)
+        assert "binding_value(" in src, src
+        per_evaluation = [c for name, group in _code_objects(src).items() if name != "<module>" for c in group]
+        assert sum(_opcount(c, "LOAD_CLOSURE") for c in per_evaluation) == 0, src
 
 
 # =============================================================================
@@ -180,16 +203,6 @@ _STAYS_INLINE = [
         "($count := function($x){ 99 }; items[$count(sub) = 2].name)",
         "v_count",
         id="builtin-shadowed-by-a-binding",
-    ),
-    pytest.param(
-        "items@$i[$i.price > 15].name",
-        "v_i",
-        id="context-binding",
-    ),
-    pytest.param(
-        "items#$p[$p = 2].name",
-        "_pair",
-        id="position-binding",
     ),
     pytest.param(
         "items[$sort(sub, function($a,$b){ $a.k > $b.k })[0].k > 2].name",

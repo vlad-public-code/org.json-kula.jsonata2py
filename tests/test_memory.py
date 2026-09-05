@@ -29,6 +29,7 @@ import concurrent.futures
 import gc
 import linecache
 import random
+import threading
 import weakref
 
 import jsonata2py as jsonata
@@ -140,6 +141,209 @@ def test_factory_itself_does_not_pin_compiled_expressions_alive():
     assert ref() is None
     # The factory itself is still perfectly usable afterwards.
     assert factory.compile("3 + 4").evaluate(None) == 7
+
+
+# =============================================================================
+# Leak shape 1: ONE expression, evaluated a great many times
+# =============================================================================
+
+
+def _live_objects() -> int:
+    """Tracked objects after a full collection.
+
+    Two passes: the first can resurrect nothing but does free cycles whose
+    finalizers create more garbage, and the generated modules here are
+    exactly that shape (a function whose __globals__ references it back).
+    """
+    gc.collect()
+    gc.collect()
+    return len(gc.get_objects())
+
+
+def test_single_expression_repeated_evaluation_does_not_accumulate():
+    """The hot-path shape: compile once at startup, evaluate forever.
+
+    Anything retained per evaluation -- a binding frame not popped, a
+    sequence cached on the module, a deadline never cleared -- grows without
+    bound here and nowhere else, because every other test drops the
+    expression long before the retention could show.
+
+    The assertion is on *growth between two phases of different size*, not on
+    a single absolute number. A leak is proportional to the iteration count,
+    so 8 000 evaluations must not cost four times what 2 000 did; a fixed
+    warm-up cost is invisible to that comparison, which is what makes it
+    robust enough to assert in CI.
+    """
+    expr = _FACTORY.compile("$sum(items[price > 10].(price * qty)) & '/' & $count(items[qty = 0])")
+    data = {"items": [{"price": i, "qty": i % 5} for i in range(50)]}
+
+    for _ in range(200):  # let one-time caches fill
+        expr.evaluate(data)
+
+    baseline = _live_objects()
+    for _ in range(2_000):
+        expr.evaluate(data)
+    after_small = _live_objects()
+    for _ in range(8_000):
+        expr.evaluate(data)
+    after_large = _live_objects()
+
+    small_growth = after_small - baseline
+    large_growth = after_large - after_small
+
+    # Measured behaviour is exactly zero growth in both phases; the slack is
+    # for objects other tests in the same process happen to leave behind.
+    assert small_growth < 200, f"2 000 evaluations retained {small_growth} objects"
+    assert large_growth < 200, f"8 000 further evaluations retained {large_growth} objects"
+    # And the shape that matters: 4x the work must not cost ~4x the objects.
+    assert large_growth <= max(small_growth, 20) * 2, (
+        f"retention scales with iteration count: {small_growth} objects for 2 000 evaluations, "
+        f"{large_growth} for 8 000 -- that is a leak, not a warm-up cost"
+    )
+
+    # The expression is still correct, and still collectible afterwards.
+    assert expr.evaluate(data) is not None
+    ref = weakref.ref(expr)
+    del expr
+    gc.collect()
+    assert ref() is None
+
+
+def test_single_expression_repeated_evaluation_under_threads_does_not_accumulate():
+    """Same shape, but the per-evaluation state lives in a ContextVar, and a
+    thread that finishes must not leave its frame stack behind."""
+    expr = _FACTORY.compile("$sum(items.price) * $factor")
+    data = {"items": [{"price": i} for i in range(40)]}
+    expected = sum(range(40))
+
+    def worker(factor: int) -> int:
+        bindings = jsonata.JsonataBindings().bind_value("factor", factor)
+        bad = 0
+        for _ in range(500):
+            if expr.evaluate(data, bindings) != expected * factor:
+                bad += 1
+        return bad
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(worker, range(1, 5)))  # warm
+
+    baseline = _live_objects()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        assert sum(pool.map(worker, range(1, 5))) == 0
+    growth = _live_objects() - baseline
+
+    assert growth < 400, f"4 threads x 500 evaluations retained {growth} objects"
+
+
+# =============================================================================
+# Leak shape 2: MANY distinct expressions, each evaluated once
+# =============================================================================
+
+
+def test_many_distinct_expressions_each_used_once_are_all_collectible():
+    """The other end of the same axis: a process that compiles constantly.
+
+    Every compiled expression carries a generated module, a code object, an
+    entry-point function whose `__globals__` points back at it, and a
+    linecache registration. If any of those pins the expression, this is
+    where it shows -- so the primary assertion is that *not one* of several
+    hundred survives a collection once the caller has dropped it.
+
+    Growth is then checked the same way as the single-expression test: by
+    comparing two run sizes rather than a single number. The factory keeps a
+    bounded code-object cache, so some growth is correct and expected; what
+    would be wrong is growth proportional to the number of expressions.
+    """
+    n = 300
+
+    def run(count: int, seed: str) -> tuple[int, int]:
+        """Compiles `count` distinct expressions, evaluates each once, drops
+        it, and returns (survivors, object growth).
+
+        The weakrefs are counted and then dropped *before* the second object
+        measurement: a `weakref.ref` is itself a tracked object, so holding
+        `count` of them shows up as exactly one object per expression --
+        growth that looks precisely like a per-expression leak and is in fact
+        this test's own bookkeeping.
+        """
+        refs: list[weakref.ref] = []
+        before = _live_objects()
+        for i in range(count):
+            expr = _FACTORY.compile(f"$sum([1..{i + 1}]) + {i} & '{seed}'")
+            refs.append(weakref.ref(expr))
+            expr.evaluate(None)
+            del expr
+        gc.collect()
+        survivors = sum(1 for r in refs if r() is not None)
+        refs.clear()
+        return survivors, _live_objects() - before
+
+    # Warm until growth settles, then measure. The factory's code-object cache
+    # is bounded by generated-source *bytes*, so it fills over the first couple
+    # of runs -- ~1 800 objects, then ~400, then zero from there on. That is a
+    # one-time cost, not a leak, but it is also why a fixed warm-up count would
+    # be a guess: this loop saturates the cache however large it is, and makes
+    # the test give the same answer run alone as it does mid-suite.
+    for attempt in range(6):
+        if run(n * 3, f"warm{attempt}")[1] == 0:
+            break
+
+    survivors_1x, growth_1x = run(n, "a")
+    survivors_3x, growth_3x = run(n * 3, "b")
+
+    assert survivors_1x == 0, f"{survivors_1x} of {n} compiled expressions survived being dropped"
+    assert survivors_3x == 0, f"{survivors_3x} of {n * 3} compiled expressions survived being dropped"
+
+    # Measured growth is 0 for both run sizes once warm. The absolute bound is
+    # slack for objects other tests in the same process leave behind; the
+    # scaling bound is the one that would catch a real per-expression leak.
+    assert growth_1x < 200, f"{n} compile-and-discard cycles retained {growth_1x} objects"
+    scaled = f"{growth_1x} objects for {n} expressions, {growth_3x} for {n * 3}"
+    assert growth_3x <= max(growth_1x, 200) * 2, f"object growth scales with expression count: {scaled}"
+
+
+def test_many_distinct_expressions_each_used_once_keep_linecache_bounded():
+    """The registration made for tracebacks is per generated module, so this
+    is the path that grows it. `_linecache_keys` is the library's own LRU
+    backstop; `linecache.cache` is the global it must not be allowed to
+    inflate."""
+    for i in range(_LINECACHE_MAX_ENTRIES + 300):
+        expr = _FACTORY.compile(f"'e{i}' & $string({i} * 2)")
+        assert expr.evaluate(None) == f"e{i}{i * 2}"
+        del expr
+
+    assert len(_linecache_keys) <= _LINECACHE_MAX_ENTRIES
+    assert len(linecache.cache) <= _LINECACHE_MAX_ENTRIES + 50
+
+
+def test_many_distinct_expressions_each_used_once_across_threads():
+    """Compile-and-discard from four threads at once: the loader mints module
+    names and registers linecache entries under a lock, and a race there
+    would either cross-wire two expressions (caught by the value check) or
+    strand an entry (caught by the survivor check)."""
+    n_per_thread = 120
+    lock = threading.Lock()
+    refs: list[weakref.ref] = []
+
+    def worker(tid: int) -> int:
+        bad = 0
+        local: list[weakref.ref] = []
+        for i in range(n_per_thread):
+            expr = _FACTORY.compile(f"{tid} * 1000 + {i}")
+            local.append(weakref.ref(expr))
+            if expr.evaluate(None) != tid * 1000 + i:
+                bad += 1
+            del expr
+        with lock:
+            refs.extend(local)
+        return bad
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        assert sum(pool.map(worker, range(4))) == 0
+
+    gc.collect()
+    survivors = sum(1 for r in refs if r() is not None)
+    assert survivors == 0, f"{survivors} of {4 * n_per_thread} expressions survived being dropped"
 
 
 # =============================================================================

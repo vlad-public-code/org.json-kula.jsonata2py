@@ -19,7 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..parser.ast_nodes import AstNode, Block, Lambda, VariableBinding, accept
-from . import scope_analyzer
+from . import scan_fusion, scope_analyzer
 from .naming import pyvar, pyvar_ref
 
 if TYPE_CHECKING:
@@ -122,12 +122,20 @@ def visit_block(t: Translator, node: Block, ctx: GenCtx) -> str:
     for name, fresh in rebind_overrides:
         ctx.state.add_local_var_with_alias(name, fresh)
 
+    # Planned before any statement is compiled, and applied by memo during
+    # compilation -- no new AST node types, no tree rewriting.
+    plan = scan_fusion.plan(exprs, ctx.state)
+    if plan is not None:
+        ctx.state.scan_plans.append(plan)
+
     try:
         body_lines: list[str] = []
         for name in holder_needed:
             body_lines.append(f"{pyvar_ref(name)} = [MISSING]")
 
-        for expr in exprs[:-1]:
+        for index, expr in enumerate(exprs[:-1]):
+            if plan is not None:
+                body_lines.extend(plan.emit_for_statement(index, ctx.state))
             if isinstance(expr, VariableBinding):
                 emit_var_binding(t, expr, body_lines, inner_ctx)
             else:
@@ -136,6 +144,8 @@ def visit_block(t: Translator, node: Block, ctx: GenCtx) -> str:
         # The last expression is in tail position when the block itself is
         # in tail position (i.e. it is the body of a lambda).
         last_ctx = inner_ctx.with_tail_position(True) if ctx.is_tail_position else inner_ctx
+        if plan is not None:
+            body_lines.extend(plan.emit_for_statement(len(exprs) - 1, ctx.state))
         last = exprs[-1]
         if isinstance(last, VariableBinding):
             emit_var_binding(t, last, body_lines, last_ctx)
@@ -148,6 +158,8 @@ def visit_block(t: Translator, node: Block, ctx: GenCtx) -> str:
         def_lines.extend(f"    {line}" for line in body_lines)
         ctx.state.helper_defs.append("\n".join(def_lines) + "\n")
     finally:
+        if plan is not None:
+            ctx.state.scan_plans.pop()
         ctx.state.pop_scope()
         ctx.state.holder_vars -= holder_needed
 

@@ -14,6 +14,11 @@ from .core import __all__ as _core_all
 
 # Lives in signature.py because it is signature-directed argument validation,
 # not a runtime primitive; core.py re-exports nothing else from that module.
-from .signature import call_builtin_ctx
+from .signature import call_builtin_ctx, sig_a, sig_t
 
-__all__ = [*_core_all, "call_builtin_ctx"]
+# Tuple-mode path evaluation (`%`, `@$v`, `#$v`). Flat like the rest of the
+# namespace, because generated code calls every runtime function bare.
+from .tuples import *  # noqa: F403
+from .tuples import __all__ as _tuples_all
+
+__all__ = [*_core_all, "call_builtin_ctx", "sig_a", "sig_t", *_tuples_all]

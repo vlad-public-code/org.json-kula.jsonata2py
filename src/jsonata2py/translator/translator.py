@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import ClassVar
 
 from ..errors import TranslatorError
@@ -67,10 +68,13 @@ from ..parser.ast_nodes import (
     Visitor,
     WildcardStep,
     accept,
+    mark_survives_sort,
 )
+from ..runtime.signature import arg_check_specs as sig_arg_check_specs
+from ..runtime.signature import arity_bounds as sig_arity_bounds
 from ..runtime.signature import direct_call_is_safe as sig_direct_call_is_safe
 from ..runtime.signature import param_count as sig_param_count
-from . import call_codegen, path_codegen, scope_analyzer
+from . import call_codegen, path_codegen, scope_analyzer, tuple_path_codegen
 from .block_codegen import visit_block as _visit_block
 from .gen_ctx import GenCtx
 from .gen_state import GenState, emit_callback
@@ -129,6 +133,7 @@ _ARITH_OPS = {"+", "-", "*", "/", "%"}
 _BUILTIN_SIGNATURES = {
     "abs": "<n-:n>",
     "append": "<xx:a>",
+    "assert": "<bs?:x>",
     "average": "<a<n>:n>",
     "base64decode": "<s-:s>",
     "base64encode": "<s-:s>",
@@ -140,9 +145,13 @@ _BUILTIN_SIGNATURES = {
     "decodeUrl": "<s-:s>",
     "decodeUrlComponent": "<s-:s>",
     "distinct": "<x:x>",
+    "each": "<o-f:a>",
     "encodeUrl": "<s-:s>",
     "encodeUrlComponent": "<s-:s>",
+    "error": "<s?:x>",
+    "eval": "<sx?:x>",
     "exists": "<x:b>",
+    "filter": "<af>",
     "floor": "<n-:n>",
     "formatBase": "<n-n?:s>",
     "formatInteger": "<n-s:s>",
@@ -153,19 +162,27 @@ _BUILTIN_SIGNATURES = {
     "length": "<s-:n>",
     "lookup": "<x-s:x>",
     "lowercase": "<s-:s>",
+    "map": "<af>",
     "match": "<s-f<s:o>n?:a<o>>",
     "max": "<a<n>:n>",
     "merge": "<a<o>:o>",
+    "millis": "<:n>",
     "min": "<a<n>:n>",
     "not": "<x-:b>",
+    "now": "<s?s?:s>",
     "number": "<(nsb)-:n>",
     "pad": "<s-ns?:s>",
     "parseInteger": "<s-s:n>",
     "power": "<n-n:n>",
+    "random": "<:n>",
+    "reduce": "<afj?:j>",
     "replace": "<s-(sf)(sf)n?:s>",
     "reverse": "<a:a>",
     "round": "<n-n?:n>",
     "shuffle": "<a:a>",
+    "sift": "<o-f?:o>",
+    "single": "<af?>",
+    "sort": "<af?:a>",
     "split": "<s-(sf)n?:a<s>>",
     "spread": "<x-:a<o>>",
     "sqrt": "<n-:n>",
@@ -204,6 +221,60 @@ def _context_dispatch(name: str, argc: int) -> str | None:
     if under_filled and not sig_direct_call_is_safe(sig, argc):
         return sig
     return None
+
+
+#: Built-ins whose call site is compiled by hand -- the higher-order ones,
+#: whose function argument the emitter translates in place rather than
+#: passing through as a value. They must never be routed through
+#: `call_builtin_ctx`, which would splat that placeholder as an argument;
+#: they still get inline argument checks like everything else.
+_OWN_CALL_SITE = frozenset(
+    {"map", "filter", "reduce", "sort", "single", "sift", "each", "eval", "error", "assert"}
+)
+
+
+#: The type symbol a literal node evaluates to, known without running it.
+_LITERAL_SYMBOL: dict[type[AstNode], str] = {
+    NumberLiteral: "n",
+    StringLiteral: "s",
+    BooleanLiteral: "b",
+    NullLiteral: "l",
+    ObjectConstructor: "o",
+    Lambda: "f",
+    RegexLiteral: "f",
+}
+
+
+#: Built-ins that already apply an untyped array parameter's coercion
+#: themselves, so wrapping the argument would only repeat it.
+#:
+#: An untyped `a` parameter never *rejects* anything -- it promotes a
+#: non-array to a one-element array and passes MISSING through -- so where
+#: the implementation does the same the wrapper is pure cost, and
+#: `$count(x)` is 21 of the benchmark's 49 wrapped arguments.
+#: `tests/runtime/test_signature_validation.py` re-derives this list
+#: differentially, so an implementation that stops coercing fails there
+#: rather than silently changing an answer.
+_ARRAY_COERCION_IS_REDUNDANT = frozenset({"count", "reverse", "zip", "sort", "append"})
+
+
+def _sig_wrap(
+    arg: str, spec: tuple[str, str] | None, i: int, node: AstNode | None, redundant: bool = False
+) -> str:
+    if spec is None:
+        return arg
+    kind, detail = spec
+    if kind == "a" and not detail and redundant:
+        return arg
+    if kind == "t" and node is not None:
+        # A literal argument's type is settled at compile time, so the check
+        # is either dead code or a compile-time error. `$round(x, 2)` is the
+        # common shape and it needs no test at all.
+        sym = _LITERAL_SYMBOL.get(type(node))
+        if sym is not None and sym in detail:
+            return arg
+    helper = "sig_a" if kind == "a" else "sig_t"
+    return f"{helper}({arg}, {py_string(detail)}, {i + 1})"
 
 
 def _is_arith_op(op: str) -> bool:
@@ -351,8 +422,21 @@ class Translator(Visitor[str, GenCtx]):
         return path_codegen.visit_path_expr(self, n, ctx)
 
     def visit_force_array(self, n: ForceArray, ctx: GenCtx) -> str:
-        if path_codegen.path_ends_with_array_constructor(n.source):
+        if not n.on_sequence:
+            # `[]` on something that is not a sequence does nothing *yet*.
+            # The node stays in the tree so a following stage still finds
+            # it in its source chain and promotes then -- see
+            # yields_sequence and _source_chain_contains_force_array.
+            return accept(n.source, self, ctx)
+        if path_codegen.path_ends_with_constructor_step(n.source):
             return accept(n.source, self, ctx.with_array_constructor_preserve())
+        if path_codegen.path_ends_with_array_constructor(n.source) or path_codegen.path_headed_by_consarray(
+            n.source
+        ):
+            # A constructor-headed sub-path: only its short-circuited empty
+            # array is a cons value, so the promotion has to be decided on
+            # the value rather than emitted unconditionally.
+            return f"force_array_cons({accept(n.source, self, ctx)})"
         return f"force_array({accept(n.source, self, ctx)})"
 
     def visit_predicate_expr(self, n: PredicateExpr, ctx: GenCtx) -> str:
@@ -547,6 +631,12 @@ class Translator(Visitor[str, GenCtx]):
         return None
 
     def visit_function_call(self, n: FunctionCall, ctx: GenCtx) -> str:
+        # A call the block's scan-fusion pass absorbed reads its slot instead.
+        # Consulted here rather than at the binding, because a scan-shaped
+        # expression can be nested inside another call -- $round($average(...), 2).
+        fused_slot = ctx.state.scan_slot(n)
+        if fused_slot is not None:
+            return fused_slot
         arg_ctx = ctx.with_tail_position(False)
         if not ctx.state.is_local(n.name) and len(n.args) == 1:
             fused = self._try_fused_call(n, ctx, arg_ctx)
@@ -577,9 +667,42 @@ class Translator(Visitor[str, GenCtx]):
         # one depends on the argument *types* -- so the decision belongs at
         # runtime. Everything below this point compiles a call that supplies
         # every parameter, where no substitution is possible.
+        own_sig = _BUILTIN_SIGNATURES.get(name)
+        if own_sig is not None:
+            bounds = sig_arity_bounds(own_sig)
+            if bounds is not None:
+                required, maximum = bounds
+                if len(a) < required or (maximum >= 0 and len(a) > maximum):
+                    # An argument count the signature cannot accept is a
+                    # signature mismatch like any other, and the reference
+                    # reports it as T0410 rather than letting the built-in
+                    # fail its own way.
+                    return f"fn_signature_error({len(a) + 1})"
+
         sig = _context_dispatch(name, len(a))
-        if sig is not None:
+        if sig is not None and name not in _OWN_CALL_SITE:
             return f"call_builtin_ctx(fn_{name}, {py_string(sig)}, {ctx.ctx_var}, [{', '.join(a)}])"
+
+        # Everything below compiles a call that supplies every parameter, so
+        # no context substitution is possible and only the argument *types*
+        # are still in question. Where the argument-to-parameter assignment
+        # cannot depend on those types, the check is a wrapper on the
+        # positions that restrict one and the call stays direct -- which is
+        # what makes validating affordable: routing these through
+        # `call_builtin_ctx` instead costs 75% of evaluation throughput.
+        if own_sig is not None:
+            specs = sig_arg_check_specs(own_sig, len(a))
+            if specs is None and name not in _OWN_CALL_SITE:
+                # No inline plan: validate at run time, where every position
+                # is seen before the first error is chosen.
+                return f"call_builtin_ctx(fn_{name}, {py_string(own_sig)}, {ctx.ctx_var}, [{', '.join(a)}])"
+            if specs is not None:
+                nodes = list(n.args)
+                redundant = name in _ARRAY_COERCION_IS_REDUNDANT
+                a = [
+                    _sig_wrap(arg, spec, i, nodes[i] if i < len(nodes) else None, redundant)
+                    for i, (arg, spec) in enumerate(zip(a, specs, strict=True))
+                ]
 
         if name == "string":
             return (
@@ -781,7 +904,11 @@ class Translator(Visitor[str, GenCtx]):
         if len(n.elements) == 1:
             elem = n.elements[0]
             if ctx.in_array_constructor_step and not isinstance(elem, ArrayConstructor):
-                return f"force_array({accept(elem, self, ctx)})"
+                # array_of, not force_array: a constructor *drops* an element
+                # that evaluates to nothing, so `[nope]` is `[]`. force_array
+                # propagates the absence instead, which made `nums.[nope]`
+                # undefined where the reference gives three empty arrays.
+                return f"array_of({accept(elem, self, ctx)})"
             elem_code = accept(elem, self, ctx)
             if isinstance(elem, ArrayConstructor):
                 return f"array_of(preserve_array({elem_code}))"
@@ -801,12 +928,24 @@ class Translator(Visitor[str, GenCtx]):
     def visit_object_constructor(self, n: ObjectConstructor, ctx: GenCtx) -> str:
         if not n.pairs:
             return "object_()"
+        # `{...}` is a group expression, so an array context is grouped over
+        # its *elements* rather than seen as one value. That fold is
+        # group_context(), and it is applied by whoever hands this
+        # constructor its context -- see map_group_step in path_codegen --
+        # rather than here, because binding it here would cost a closure per
+        # evaluation on every object construction (all of them, not just the
+        # ones that can see an array).
         all_keys_literal = all(isinstance(p.key, StringLiteral) for p in n.pairs)
         if all_keys_literal:
-            keys = [py_string(p.key.value) for p in n.pairs if isinstance(p.key, StringLiteral)]
+            literal_keys = [p.key.value for p in n.pairs if isinstance(p.key, StringLiteral)]
+            keys = [py_string(k) for k in literal_keys]
             values = [accept(p.value, self, ctx) for p in n.pairs]
             key_field = ctx.state.key_array(f"[{', '.join(keys)}]")
-            return f"object_of({key_field}, [{', '.join(values)}])"
+            # Two literal keys can only collide as written, so D1009 is
+            # decidable here; when they do not, the per-key duplicate check
+            # is dead weight on every evaluation.
+            builder = "object_of" if len(set(literal_keys)) != len(literal_keys) else "object_of_distinct"
+            return f"{builder}({key_field}, [{', '.join(values)}])"
         parts = []
         for p in n.pairs:
             parts.append(accept(p.key, self, ctx))
@@ -821,6 +960,13 @@ class Translator(Visitor[str, GenCtx]):
         return f"range_({accept(n.from_, self, ctx)}, {accept(n.to, self, ctx)})"
 
     def visit_sort_expr(self, n: SortExpr, ctx: GenCtx) -> str:
+        if isinstance(n.source, PathExpr) and tuple_path_codegen.path_needs_tuples(list(n.source.steps)):
+            # `objs@$e^($e)` sorts by a *binding*, so the sort has to happen
+            # over the tuple stream: collapsing to values first drops the
+            # bindings the key expression reads. As a step of that path it
+            # does, and the tuple compiler already handles a sort step.
+            merged = PathExpr([*n.source.steps, SortExpr(ContextRef(), n.keys)])
+            return accept(merged, self, ctx)
         has_parent_ref = any(ctx.state.contains_parent_step(k.key) for k in n.keys)
         if has_parent_ref and isinstance(n.source, PathExpr):
             return self._compile_sort_with_parent(n, n.source, ctx)
@@ -830,6 +976,34 @@ class Translator(Visitor[str, GenCtx]):
             cb = self._sort_key_callback(sk.key, ctx)
             sorted_call = f"fn_sort({result}, {cb})"
             result = f"fn_reverse({sorted_call})" if sk.descending else sorted_call
+        # Two sources survive the sort without collapsing. A constructor's own
+        # array is a `cons` value, and a cons value is not a sequence, so the
+        # collapse does not apply: `a.[1]^(x)` is `[1]`, not `1`. A `[]`-wrapped
+        # source carries the reference's `keepSingleton` flag through the sort
+        # for the same reason: `a.b[]^($)` is `[1]`.
+        if (
+            isinstance(n.source, ForceArray)
+            and n.source.on_sequence
+            and mark_survives_sort(n.source.source)
+        ):
+            return f"keep_singleton({result})"
+        if mark_survives_sort(n.source) and (
+            path_codegen.step_carries_live_mark(n.source)
+            or (
+                isinstance(n.source, PathExpr)
+                and any(path_codegen.step_carries_live_mark(st) for st in n.source.steps)
+            )
+        ):
+            # The path's own `[]` mark is read at the end of the path, and a
+            # sort of it is still the same path's value: `nums[][0]^($)` is
+            # `[1]`.
+            return f"force_array({result})"
+        if path_codegen.path_ends_with_array_constructor(n.source):
+            return result
+        if path_codegen.path_headed_by_consarray(n.source):
+            # *May* be the head's cons array -- `[].x^($)` is `[]` -- but
+            # need not be: `[1].$^($)` is `1`. Only the value can say.
+            return f"unwrap_cons({result})"
         return f"unwrap({result})"
 
     def _sort_key_callback(self, key: AstNode, ctx: GenCtx) -> str:
@@ -965,6 +1139,12 @@ class Translator(Visitor[str, GenCtx]):
         body_lines: list[str] = []
         body_lines.append("_result = {}")
         body_lines.append("_items = _src if isinstance(_src, list) else ([] if _src is MISSING else [_src])")
+        # An empty or absent source still runs the pairs once, with an absent
+        # context: the reference pushes `undefined` into an empty input so a
+        # literal-keyed object is still generated. `nope{"k":1}` is `{"k":1}`,
+        # and `nope{"k":$string($)}` is `{}` because the *value* drops out.
+        body_lines.append("if not _items:")
+        body_lines.append("    _items = [MISSING]")
         for pi, (k_expr, v_expr) in enumerate(pair_exprs):
             grp_var = f"_grp{pi}"
             body_lines.append(f"{grp_var} = {{}}")
@@ -976,9 +1156,19 @@ class Translator(Visitor[str, GenCtx]):
             )
             body_lines.append(f"    if _kNode{pi} is MISSING:")
             body_lines.append("        continue")
-            body_lines.append(f"    {grp_var}.setdefault(_kNode{pi}, []).append({elem_var})")
-            body_lines.append(f"for _k{pi}, _grpArr{pi} in {grp_var}.items():")
-            body_lines.append(f"    {elem_var} = _grpArr{pi}[0] if len(_grpArr{pi}) == 1 else _grpArr{pi}")
+            # The reference accumulates a group with fn.append, which
+            # concatenates and flattens one level -- not by collecting the
+            # items into a list. The difference shows the moment an item is
+            # itself an array: grouping `[[1,2],[3]]` under one key gives
+            # `[1,2,3]`, and a lone `[3]` stays `[3]` because the first item
+            # is stored verbatim.
+            body_lines.append(f"    if _kNode{pi} in {grp_var}:")
+            body_lines.append(
+                f"        {grp_var}[_kNode{pi}] = fn_append({grp_var}[_kNode{pi}], {elem_var})"
+            )
+            body_lines.append("    else:")
+            body_lines.append(f"        {grp_var}[_kNode{pi}] = {elem_var}")
+            body_lines.append(f"for _k{pi}, {elem_var} in {grp_var}.items():")
             if ctx.primary_context_var is not None:
                 body_lines.append(f"    {ctx.primary_context_var} = {elem_var}")
             body_lines.append(f"    _v{pi} = {v_expr}")
@@ -989,8 +1179,6 @@ class Translator(Visitor[str, GenCtx]):
                 f'+ str(_k{pi}) + "\'")'
             )
             body_lines.append(f"        _result[_k{pi}] = _v{pi}")
-        body_lines.append("if _src is MISSING:")
-        body_lines.append("    return MISSING")
         body_lines.append("return _result")
 
         def_params = ["_src", ctx.root_var, *extra_param_decls]
@@ -1012,14 +1200,42 @@ class Translator(Visitor[str, GenCtx]):
         if isinstance(step, FunctionCall):
             args_with_pipe: list[AstNode] = [PartialPlaceholder(), *step.args]
             return self.visit_partial_application(PartialApplication(step.name, args_with_pipe), ctx)
-        if isinstance(step, ForceArray) and isinstance(step.source, FunctionCall):
-            fc = step.source
-            args_with_pipe = [PartialPlaceholder(), *fc.args]
-            inner_partial = self.visit_partial_application(PartialApplication(fc.name, args_with_pipe), ctx)
-            id_ = ctx.state.next_id()
-            arg_var = f"_cfaArg{id_}"
-            return f"lambda_value(lambda {arg_var}: force_array(fn_apply({inner_partial}, {arg_var})), 1)"
+        staged = self._chain_step_stages(step, ctx)
+        if staged is not None:
+            return staged
         return accept(step, self, ctx)
+
+    #: Postfix forms the reference records as `stages` on an apply node.
+    _CHAIN_STAGES = (ForceArray, PredicateExpr, ArraySubscript, SortExpr)
+
+    def _chain_step_stages(self, step: AstNode, ctx: GenCtx) -> str | None:
+        """`a ~> $f()[0]`, `~> $f()[]`, `~> $f()^($)`.
+
+        A postfix written after the call in a `~>` step is not part of the
+        call: the reference hangs it on the *apply* node as a stage, so it
+        runs over whatever the application returned. Peeling it off and
+        replaying it there is exactly that -- and it is also the only way
+        the call itself stays the partial application `~>` needs.
+        """
+        stages: list[AstNode] = []
+        base = step
+        while isinstance(base, self._CHAIN_STAGES):
+            stages.append(base)
+            base = base.source
+        if not stages or not isinstance(base, FunctionCall):
+            return None
+        args_with_pipe: list[AstNode] = [PartialPlaceholder(), *base.args]
+        partial = self.visit_partial_application(PartialApplication(base.name, args_with_pipe), ctx)
+        if len(stages) == 1 and isinstance(stages[0], ForceArray) and not stages[0].on_sequence:
+            # `nums ~> $sum()[]` -- the mark inherits the call's answer, and
+            # $sum's is "not a sequence", so it does nothing at all.
+            return partial
+        arg_var = f"_cfaArg{ctx.state.next_id()}"
+        replayed: AstNode = ContextRef()
+        for stage in reversed(stages):
+            replayed = replace(stage, source=replayed)  # type: ignore[type-var]
+        body = accept(replayed, self, ctx.with_ctx(f"fn_apply({partial}, {arg_var})"))
+        return f"lambda_value(lambda {arg_var}: {body}, 1)"
 
     def visit_transform_expr(self, n: TransformExpr, ctx: GenCtx) -> str:
         src_expr = accept(n.source, self, ctx)
@@ -1045,10 +1261,16 @@ class Translator(Visitor[str, GenCtx]):
 
 def _source_chain_contains_force_array(node: AstNode) -> bool:
     if isinstance(node, ForceArray):
-        return True
+        # A group-by swallows the mark. evaluatePath runs the group *after*
+        # the keepSingletonArray branch and replaces the whole result with
+        # its object, so nothing downstream can ever see a sequence:
+        # `a{"k":b}[][0]` is `{"k":1}`, not `[{"k":1}]`.
+        return not isinstance(node.source, GroupByExpr)
     if isinstance(node, SortExpr):
         return _source_chain_contains_force_array(node.source)
-    if isinstance(node, PredicateExpr):
+    if isinstance(node, (PredicateExpr, ArraySubscript)):
+        # Through a subscript as well as a predicate: `nums[][0][0]` is
+        # `[1]`, because both stages hang off the same marked step.
         return _source_chain_contains_force_array(node.source)
     if isinstance(node, PathExpr):
         return any(_source_chain_contains_force_array(s) for s in node.steps)

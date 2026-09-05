@@ -421,6 +421,29 @@ def param_count(signature: str) -> int:
     return len(m.params)
 
 
+def arity_bounds(signature: str) -> tuple[int, int] | None:
+    """(required, maximum) argument counts, or None when not modelled.
+
+    A parameter is required unless it is optional (`?`) or can be filled by
+    the evaluation context (`-`). `maximum` is -1 for a variadic signature.
+    The reference reports a count outside these bounds as T0410, like any
+    other signature mismatch.
+    """
+    if signature.startswith("<:"):
+        # A signature with no parameters at all ($millis, $random): any
+        # argument is one too many.
+        return (0, 0)
+    matcher = _compile_matcher(signature)
+    if matcher is None:
+        return None
+    if any(p.regex.endswith("+") for p in matcher.params):
+        return (0, -1)
+    required = sum(
+        1 for p in matcher.params if not p.regex.endswith("?") and not p.context
+    )
+    return (required, len(matcher.params))
+
+
 def _raise_t0410(matcher: _Matcher, args: list[Any], supplied: str) -> None:
     """Reports which argument first failed to match, as the reference's
     `throwValidationError` does."""
@@ -437,6 +460,195 @@ def _raise_t0410(matcher: _Matcher, args: list[Any], supplied: str) -> None:
     )
 
 
+#: Python classes per type symbol, for the specialised checker. `n` excludes
+#: bool deliberately -- `True.__class__` is `bool`, never `int`, so a class
+#: membership test gets JSONata's number/boolean split right for free.
+_CLASS_SYMBOL: dict[type, str] = {
+    bool: "b",
+    str: "s",
+    int: "n",
+    float: "n",
+    list: "a",
+    dict: "o",
+    type(None): "l",
+}
+
+
+def _fast_symbol(value: Any) -> str:
+    """`_symbol` without the isinstance chain, for the common classes."""
+    sym = _CLASS_SYMBOL.get(value.__class__)
+    return sym if sym is not None else _symbol(value)
+
+
+@lru_cache(maxsize=512)
+def _fixed_plan(signature: str, argc: int) -> tuple[tuple[frozenset[str] | None, bool, str | None], ...] | None:
+    """A per-position check plan for a call whose argument-to-parameter
+    assignment cannot depend on the argument types, or None when it can.
+
+    This is the fast half of `validate_with_context`. The general path has to
+    discover *which* parameter each argument landed on, and pays a symbol
+    string, a regex match and a group walk per call to do it -- 36 times per
+    evaluation of the benchmark expression, which is half its runtime. When
+    every parameter consumes exactly one argument, none of that is needed:
+    position `i` is parameter `i`, and all that is left is one type test per
+    position that restricts anything.
+
+    Decided the same way `direct_call_is_safe` decides its question, by
+    exhausting the symbol alphabet rather than reasoning about the grammar.
+    Combinations that match nothing are fine here -- they raise T0410 at run
+    time, exactly as the general path would.
+    """
+    matcher = _compile_matcher(signature)
+    if matcher is None or argc > len(matcher.params) or argc > 4:
+        return None
+    if any(p.regex.endswith("+") for p in matcher.params):
+        return None
+    for p in matcher.params[argc:]:
+        # A trailing parameter this call does not supply must be genuinely
+        # optional. One the *evaluation context* could fill instead shifts
+        # the assignment, which is the case this plan cannot describe.
+        if p.context or not p.regex.endswith("?"):
+            return None
+    want = [1] * argc + [0] * (len(matcher.params) - argc)
+    for combo in product(_SYMBOLS, repeat=argc):
+        m = matcher.regex.match("".join(combo))
+        if m is None:
+            continue  # a T0410 at run time, whichever path takes it
+        if [len(m.group(i + 1)) for i in range(len(matcher.params))] != want:
+            return None
+    plan: list[tuple[frozenset[str] | None, bool, str | None]] = []
+    for p in matcher.params:
+        accepted = frozenset(sym for sym in _SYMBOLS if re.fullmatch(p.regex, sym))
+        # A parameter that accepts every symbol needs no test at all.
+        restrict = None if len(accepted) == len(_SYMBOLS) else accepted
+        plan.append((restrict, p.array, p.subtype))
+    return tuple(plan)
+
+
+def _validate_fixed(
+    plan: tuple[tuple[frozenset[str] | None, bool, str | None], ...],
+    args: list[Any],
+) -> list[Any]:
+    # Two passes, because the reference matches the whole argument list
+    # against the signature before it looks at any array's element types: a
+    # T0410 on a later position outranks a T0412 on an earlier one, so
+    # `$join(nums, nums)` is T0410.
+    syms = [_fast_symbol(a) for a in args]
+    for i, (accepted, _, _) in enumerate(plan[: len(args)]):
+        if accepted is not None and syms[i] not in accepted:
+            raise RuntimeEvaluationError(
+                "T0410", f"Argument {i + 1} of function does not match function signature"
+            )
+    out: list[Any] = []
+    for i, (_, is_array, subtype) in enumerate(plan[: len(args)]):
+        out.append(_fixed_array_arg(args[i], syms[i], subtype, i) if is_array else args[i])
+    return out
+
+
+def _fixed_array_arg(arg: Any, sym: str, subtype: str | None, arg_idx: int) -> Any:
+    """The array parameter rules, without the general path's group bookkeeping.
+
+    The element scan is a class-membership test per element rather than a
+    `_symbol` call, because this runs over the whole argument on the hot path
+    (`$sum(items.value)` scans before it sums).
+    """
+    if sym == "m":
+        return MISSING
+    if subtype is not None:
+        want = subtype[0]
+        if sym != "a":
+            if sym != want:
+                _raise_t0412(subtype, arg_idx)
+        elif arg:
+            first = _fast_symbol(arg[0])
+            if first != want or any(_fast_symbol(v) != first for v in arg):
+                _raise_t0412(subtype, arg_idx)
+    return arg if sym == "a" else [arg]
+
+
+def _raise_t0412(subtype: str | None, arg_idx: int) -> None:
+    raise RuntimeEvaluationError(
+        "T0412",
+        f"Argument {arg_idx + 1} of function must be an array of "
+        f"{_ARRAY_TYPE_NAMES.get(subtype or '', 'values')}",
+    )
+
+
+def arg_check_specs(signature: str, argc: int) -> tuple[tuple[str, str] | None, ...] | None:
+    """Per-argument checks a *fully supplied* call can apply inline.
+
+    The translator asks this at compile time and wraps only the arguments
+    that need it, then emits the built-in call directly. That is the whole
+    difference between validation costing 31% of evaluation and costing
+    nothing measurable: the wrapper form (`call_builtin_ctx` -> plan lookup
+    -> validate -> splat a fresh list) is four Python calls per built-in
+    call, and the benchmark makes 36 of them per evaluation.
+
+    Returns None when the assignment is not fixed, so the caller falls back
+    to the runtime path.
+    """
+    plan = _fixed_plan(signature, argc)
+    if plan is None:
+        return None
+    # Inline checks run in argument order, but the reference matches the
+    # *whole* argument list against the signature before it looks at any
+    # array's element types -- so a T0410 on a later position outranks a
+    # T0412 on an earlier one (`$join(nums, nums)` is T0410, not T0412).
+    # Where both kinds are in play, hand the call back to the runtime path,
+    # which sees every position before it decides. None of those signatures
+    # is on a hot path.
+    subtyped = sum(1 for _, is_array, sub in plan[:argc] if is_array and sub)
+    restricted = sum(1 for acc, is_array, _ in plan[:argc] if acc is not None or is_array)
+    if subtyped and restricted > 1:
+        return None
+    specs: list[tuple[str, str] | None] = []
+    for accepted, is_array, subtype in plan[:argc]:
+        if is_array:
+            specs.append(("a", subtype or ""))
+        elif accepted is not None:
+            specs.append(("t", "".join(sorted(accepted))))
+        else:
+            specs.append(None)
+    return tuple(specs)
+
+
+def sig_t(value: Any, accepted: str, argno: int) -> Any:
+    """One scalar-typed parameter position of a fully supplied call."""
+    sym = _CLASS_SYMBOL.get(value.__class__)
+    if (sym if sym is not None else _symbol(value)) not in accepted:
+        raise RuntimeEvaluationError(
+            "T0410", f"Argument {argno} of function does not match function signature"
+        )
+    return value
+
+
+def sig_a(value: Any, subtype: str, argno: int) -> Any:
+    """One array-typed parameter position: the element-type check and the
+    reference's singleton-to-array promotion.
+
+    Hand-inlined rather than delegating, because this is the shape almost
+    every aggregate call takes (`$count(x)`, `$sum(x)`) and the delegation
+    was two more Python calls per argument.
+    """
+    if value.__class__ is list:
+        if not subtype:
+            return value
+        if value:
+            want = subtype[0]
+            first = _fast_symbol(value[0])
+            if first != want or any(_fast_symbol(v) != first for v in value):
+                _raise_t0412(subtype, argno - 1)
+        return value
+    if value is MISSING:
+        return MISSING
+    sym = _fast_symbol(value)
+    if sym == "a":  # a list subclass, e.g. Preserved
+        return sig_a(list(value), subtype, argno)
+    if subtype and sym != subtype[0]:
+        _raise_t0412(subtype, argno - 1)
+    return [value]
+
+
 def validate_with_context(signature: str, args: list[Any], context: Any) -> list[Any]:
     """Matches args against signature, substituting context for any focus
     ('-') parameter the arguments do not reach.
@@ -445,6 +657,10 @@ def validate_with_context(signature: str, args: list[Any], context: Any) -> list
     context value is the wrong type to stand in for a parameter, and T0412
     when an array parameter's element types are wrong.
     """
+    plan = _fixed_plan(signature, len(args))
+    if plan is not None:
+        return _validate_fixed(plan, args)
+
     matcher = _compile_matcher(signature)
     if matcher is None:
         return args

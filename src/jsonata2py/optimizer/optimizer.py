@@ -38,6 +38,8 @@ Java `==` reference-identity checks.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from dataclasses import replace
 
 from ..parser.ast_nodes import (
     ArrayConstructor,
@@ -84,6 +86,7 @@ from ..parser.ast_nodes import (
     Visitor,
     WildcardStep,
     accept,
+    consarray_sub_path,
 )
 
 
@@ -219,7 +222,17 @@ class _RewriteVisitor(Visitor[AstNode, None]):
         # element.
         flat: list[AstNode] = []
         prev_was_context_binding = False
-        for step in node.steps:
+        # A parenthesised *head* of a binding path is a value, not a step, so
+        # `@$v` after it has nothing to revert to: `(a.b)@$e` is `1`, where
+        # `a.b@$e` is `{"b":1}`. Stripping the wrapper made the two the same.
+        binding_path = any(_carries_binding(st) for st in node.steps)
+        for i, step in enumerate(node.steps):
+            if i == 0 and binding_path and _paren_head(step) is not None:
+                # Reaches through a `[]`, because `(a.b)[]@$e` is `1` for the
+                # same reason `(a.b)@$e` is: the parenthesised path is a
+                # value, so the binding has nothing to revert to.
+                flat.append(_rewrite_paren_head(step, self.rewrite))
+                continue
             if prev_was_context_binding and isinstance(step, Parenthesized):
                 # Preserve the Parenthesized wrapper so the translator can
                 # detect the cross-join pattern: rewrite only the inner
@@ -229,7 +242,7 @@ class _RewriteVisitor(Visitor[AstNode, None]):
                 prev_was_context_binding = False
                 continue
             rewritten = self.rewrite(step)
-            if isinstance(rewritten, PathExpr) and not _path_has_wildcard(rewritten):
+            if isinstance(rewritten, PathExpr) and not _path_has_wildcard(rewritten) and (not flat or consarray_sub_path(rewritten) is None):
                 flat.extend(rewritten.steps)
             else:
                 flat.append(rewritten)
@@ -252,7 +265,9 @@ class _RewriteVisitor(Visitor[AstNode, None]):
 
     def visit_array_constructor(self, node: ArrayConstructor, ctx: None) -> AstNode:
         elements = self._rewrite_list(node.elements)
-        return node if elements == node.elements else ArrayConstructor(elements)
+        # replace(), not ArrayConstructor(elements): rebuilding would drop
+        # path_head, which the parser set and the translator still needs.
+        return node if elements == node.elements else replace(node, elements=elements)
 
     def visit_object_constructor(self, node: ObjectConstructor, ctx: None) -> AstNode:
         pairs = self._rewrite_pairs(node.pairs)
@@ -313,14 +328,30 @@ class _RewriteVisitor(Visitor[AstNode, None]):
         # Exception: preserve the wrapper when inner is a VariableBinding (or
         # a Block containing bindings) so that parenthesised assignments do
         # not inadvertently reassign outer-scope variables of the same name.
+        # Exception: preserve the wrapper when inner is an ArrayConstructor.
+        # The reference marks a *bare* `[...]` path step `consarray`, which
+        # stops its per-element array from flattening into the outer sequence
+        # (`nums.[1,2]` is `[[1,2],[1,2],[1,2]]`); parenthesising the same
+        # constructor removes the marking and it flattens like any other
+        # expression step (`nums.([1,2])` is `[1,2,1,2,1,2]`). Stripping the
+        # wrapper made the two indistinguishable. This is the same
+        # "parenthesising defeats the flag" rule as `([]).x` versus `[].x`,
+        # at the other end of the path -- see the parser's two flag sites.
+        # Exception: preserve the wrapper when the inner expression is a path
+        # that starts by *re-rooting* -- `$$` or `%`. A parenthesised
+        # path is a step of its parent, evaluated once per element, not a
+        # continuation of it: `nums.($$.nums[0])` is five copies of `1`, and
+        # `o.(%.s)` resolves `%` against the step's own input. Flattening the
+        # steps into the parent makes the first absolute (one result) and
+        # leaves the second with no parent level to land on (S0217).
         inner = self.rewrite(node.inner)
-        if isinstance(inner, VariableBinding):
+        if isinstance(inner, (VariableBinding, ArrayConstructor)) or _rerooting_path(inner):
             return Parenthesized(inner)
         return inner
 
     def visit_force_array(self, node: ForceArray, ctx: None) -> AstNode:
         source = self.rewrite(node.source)
-        return node if source is node.source else ForceArray(source)
+        return node if source is node.source else ForceArray(source, node.on_sequence)
 
     def visit_transform_expr(self, node: TransformExpr, ctx: None) -> AstNode:
         source = self.rewrite(node.source)
@@ -394,6 +425,46 @@ _VISITOR = _RewriteVisitor()
 # =============================================================================
 # Constant-folding logic
 # =============================================================================
+
+
+def _paren_head(node: AstNode) -> Parenthesized | None:
+    """The parenthesised node under a head's `[]` wrappers, if any."""
+    if isinstance(node, Parenthesized):
+        return node
+    if isinstance(node, ForceArray):
+        return _paren_head(node.source)
+    return None
+
+
+def _rewrite_paren_head(node: AstNode, rewrite: Callable[[AstNode], AstNode]) -> AstNode:
+    """Rewrites inside a parenthesised head without stripping its wrapper."""
+    if isinstance(node, Parenthesized):
+        inner = rewrite(node.inner)
+        return node if inner is node.inner else Parenthesized(inner)
+    if isinstance(node, ForceArray):
+        src = _rewrite_paren_head(node.source, rewrite)
+        return node if src is node.source else ForceArray(src, node.on_sequence)
+    return rewrite(node)
+
+
+def _carries_binding(node: AstNode) -> bool:
+    """A binding, or a stage folded onto one."""
+    if isinstance(node, (ContextBinding, PositionBinding)):
+        return True
+    if isinstance(node, (PredicateExpr, ArraySubscript, SortExpr, ForceArray, GroupByExpr)):
+        return _carries_binding(node.source)
+    return False
+
+
+def _rerooting_path(node: AstNode) -> bool:
+    """True for a path whose first step re-roots the context."""
+    return (
+        isinstance(node, PathExpr)
+        and bool(node.steps)
+        # `$` is not re-rooting: it *is* the current context, so flattening
+        # `$.X` into the parent means the same thing.
+        and isinstance(node.steps[0], (RootRef, ParentStep))
+    )
 
 
 def _try_fold(op: str, left: AstNode, right: AstNode) -> AstNode | None:
