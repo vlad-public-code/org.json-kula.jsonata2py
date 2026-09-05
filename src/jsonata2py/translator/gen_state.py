@@ -45,6 +45,7 @@ from ..parser.ast_nodes import (
 
 if TYPE_CHECKING:
     from .gen_ctx import GenCtx
+    from .scan_fusion import ScanPlan
 
 
 class GenState:
@@ -58,6 +59,10 @@ class GenState:
         # Buffer of complete top-level `def ...` blocks, appended as they're
         # generated (mirrors Java's helperMethods StringBuilder).
         self.helper_defs: list[str] = []
+        # Active sequence-scan fusion plans, innermost last. A block pushes
+        # its plan before compiling its statements so visit_function_call can
+        # redirect an absorbed call to its slot; nested blocks plan their own.
+        self.scan_plans: list[ScanPlan] = []
         # Local declaration lines emitted before the body expression inside
         # _evaluate (e.g. counter-list declarations for global #$pos counters).
         self.local_declarations: list[str] = []
@@ -196,6 +201,19 @@ class GenState:
         if self.scope_stack:
             self.scope_stack[-1].add(name)
             self._alias_stack[-1][name] = python_name
+
+    def scan_slot(self, node: AstNode) -> str | None:
+        """The fused-scan slot expression replacing `node`, or None.
+
+        Matched by node *identity*: two occurrences of the same expression
+        text are two separate operations, and only the one the pass planned
+        for may be redirected.
+        """
+        for plan in reversed(self.scan_plans):
+            slot = plan.slot_for(node)
+            if slot is not None:
+                return slot
+        return None
 
     def is_local(self, name: str) -> bool:
         return any(name in scope for scope in self.scope_stack)

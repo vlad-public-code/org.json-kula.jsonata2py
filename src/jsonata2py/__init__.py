@@ -21,7 +21,7 @@ from .factory import JsonataExpressionFactory
 from .library import JsonataLibrary, JsonataLibraryOptions
 from .runtime.values import MISSING
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 __all__ = [
     "MISSING",

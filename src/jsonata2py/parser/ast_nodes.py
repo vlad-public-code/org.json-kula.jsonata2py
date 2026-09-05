@@ -165,9 +165,18 @@ class ArrayConstructor(AstNode):
 
     Attributes:
         elements: the element expressions (may be empty)
+        path_head: True when this constructor is the syntactic first step
+            of a multi-step PathExpr (`[...].x`), possibly through a sort
+            (`[...]^(k).x`). Mirrors the reference implementation's
+            `consarray` flag, which it sets at parse time for the same
+            reason we must: the optimizer folds `Parenthesized` away, so by
+            translation time `([]).x` and `[].x` are the same tree, yet the
+            reference distinguishes them. See docs and the translator's
+            consarray-head short-circuit.
     """
 
     elements: list[AstNode]
+    path_head: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,9 +517,14 @@ class ForceArray(AstNode):
 
     Attributes:
         source: the expression whose result must be an array
+        on_sequence: whether `source` builds a *sequence*, decided by
+            `yields_sequence` at parse time. When it does not, this `[]`
+            does nothing yet -- but it stays in the tree, because a later
+            stage on the same node makes it fire (`1[][0]` is `[1]`).
     """
 
     source: AstNode
+    on_sequence: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -744,3 +758,194 @@ AstNodeUnion = (
     | PartialApplication
     | LambdaCall
 )
+
+
+# =============================================================================
+# Shared AST predicates for the consarray (array-constructor path head) rule
+# =============================================================================
+
+
+def consarray_path_head(step: AstNode) -> ArrayConstructor | None:
+    """The array constructor heading a path, if the parser flagged it.
+
+    Reaches through a sort, because `[...]^(k).x` parses as
+    `SortExpr(ArrayConstructor(...))` here while the reference keeps the
+    constructor as `steps[0]`.
+
+    The *flag* decides, never the node type: the optimizer strips
+    `Parenthesized`, so `([]).x` also reaches the later stages with an
+    `ArrayConstructor` head -- and must stay undefined.
+    """
+    if isinstance(step, ArrayConstructor):
+        return step if step.path_head else None
+    if isinstance(step, SortExpr):
+        return consarray_path_head(step.source)
+    return None
+
+
+def staged_consarray_head(step: AstNode) -> ArrayConstructor | None:
+    """The flagged constructor under a head step's stages, if any.
+
+    §1's short-circuit hands the head's *value* to the next step, and the
+    reference's step loop iterates it with `for (ii < input.length)`. A bare
+    constructor is always an array, so that always works -- but a stage or a
+    group on the head can turn it into a scalar or an object, and then the
+    next step iterates nothing and the whole path is undefined. `[1][0]` is
+    `1`, yet `[1][0].$` and `[1]{"k":1}.$` are both undefined.
+    """
+    if not isinstance(step, (ArraySubscript, PredicateExpr, GroupByExpr, ForceArray)):
+        return None
+    inner: AstNode = step.source
+    while isinstance(inner, (ArraySubscript, PredicateExpr, GroupByExpr, ForceArray)):
+        inner = inner.source
+    return consarray_path_head(inner)
+
+
+#: Element node types that always contribute a value to their constructor.
+#: A constructor drops elements that evaluate to nothing, so `[nope]` is
+#: empty at run time -- but none of these can be dropped, and one of them is
+#: enough to prove the constructor non-empty. `RangeExpr` is absent on
+#: purpose: `[5..1]` is empty.
+_UNDROPPABLE_ELEMENTS: tuple[type[AstNode], ...] = (
+    StringLiteral,
+    NumberLiteral,
+    BooleanLiteral,
+    NullLiteral,
+    ArrayConstructor,
+    ObjectConstructor,
+    Lambda,
+)
+
+
+def array_ctor_always_yields_value(ctor: ArrayConstructor) -> bool:
+    """True if `ctor` provably cannot come out empty.
+
+    Deliberately conservative -- an unrecognised node counts as droppable.
+    Being wrong in that direction costs one array-emptiness test; being
+    wrong in the other silently changes behaviour.
+    """
+    return any(isinstance(e, _UNDROPPABLE_ELEMENTS) for e in ctor.elements)
+
+
+def consarray_sub_path(step: AstNode) -> ArrayConstructor | None:
+    """The head constructor of a sub-path that must not be flattened into
+    its parent path, or None if the step is an ordinary one.
+
+    A parenthesised path is a *step* of its parent, not a continuation of
+    it, and the reference treats it as one: the step is evaluated per
+    context element and its result flattened into the parent sequence like
+    any other expression step. Flattening the sub-path's steps into the
+    parent instead gets two things wrong at once -- it moves the flagged
+    constructor off position 0, losing the empty-head short-circuit
+    (`a.([].x)`), and it turns the constructor into a *bare* step, which the
+    reference marks `cons` and does not flatten (`nums.([1,2,3].$)` is nine
+    elements, not three arrays).
+    """
+    if not isinstance(step, PathExpr) or not step.steps:
+        return None
+    return consarray_path_head(step.steps[0])
+
+
+#: Built-ins whose result the reference constructs with `createSequence`, so
+#: a following `[]` has a sequence to mark. Everything else -- including
+#: `$append` (`concat` returns a plain array) and `$eval` (it hands back
+#: whatever the evaluated expression returned) -- does not.
+#:
+#: `$lookup` is deliberately absent: it builds a sequence only when its
+#: input was an array, which is a value property rather than a syntactic
+#: one, so it carries its own keepArray-aware entry point instead.
+#: Names are stored without the `$`, as the parser records them.
+_SEQUENCE_BUILDING_BUILTINS: frozenset[str] = frozenset(
+    {"map", "filter", "keys", "spread", "each", "match", "distinct"}
+)
+
+
+def yields_sequence(node: AstNode) -> bool:
+    """True if `node`'s result is a *sequence* rather than a plain value.
+
+    This is the question `expr[]` turns on. The reference sets `keepArray`
+    on the node and reads it back in `evaluate` inside the
+    `isSequence(result)` branch, so `[]` after anything that is not a
+    sequence does nothing at all -- `1[]` is `1`, `{}[]` is `{}`,
+    `$sum(nums)[]` is `6`. The mark is not lost, though: it stays on the
+    node and fires for the next thing on it that *does* build a sequence,
+    which is why `1[][0]` is `[1]`. That second half is carried by the AST
+    itself -- a following stage still sees the `ForceArray` in its source
+    chain.
+
+    The decision has to be taken on the parse tree rather than the
+    optimised one, because the optimizer folds `Parenthesized` away and
+    that wrapper is exactly what separates `(a.b)[]` (`1`) from `a.b[]`
+    (`[1]`).
+    """
+    if isinstance(node, ForceArray):
+        # `x[][]` -- the inner mark has not fired yet, so neither does this
+        # one unless what it wraps builds a sequence on its own.
+        return yields_sequence(node.source)
+    if isinstance(node, PathExpr):
+        return not _is_bare_focus_path(node)
+    if isinstance(node, (FieldRef, WildcardStep, DescendantStep, ParentStep)):
+        return True
+    if isinstance(node, (PredicateExpr, ArraySubscript)):
+        # A filter or subscript stage builds its result with createSequence
+        # whatever it ran over, so `1[0][]` is `[1]`.
+        return True
+    if isinstance(node, SortExpr):
+        # A sort builds its result with createSequence, so a `[]` on the
+        # sort *node* fires: `1^($)[]` is `[1]`. That is a different node
+        # from `1[]^($)`, where the mark sits on the literal and never
+        # fires -- see mark_survives_sort for that direction.
+        return True
+    if isinstance(node, FunctionCall):
+        return node.name in _SEQUENCE_BUILDING_BUILTINS
+    if isinstance(node, ChainExpr):
+        # `a ~> $f()` carries the mark on the apply node, whose result is
+        # whatever the last stage returned.
+        return yields_sequence(node.steps[-1]) if node.steps else False
+    return False
+
+
+def _is_bare_focus_path(node: PathExpr) -> bool:
+    """A non-path left side carrying only focus bindings.
+
+    The reference's `@` production hangs the focus off whatever the left side
+    already was, and only the `.` production makes a path -- so `$@$e`,
+    `1@$e` and `$sum(x)@$e` are all still just their left side, with no
+    sequence for a `[]` to mark. `#` does wrap, which is why `$#$i[]` keeps
+    its array while `$@$e[]` does not.
+    """
+    steps = node.steps
+    if not steps or is_path_node(steps[0]):
+        return False
+    return all(isinstance(s, ContextBinding) for s in steps[1:])
+
+
+def is_path_node(node: AstNode) -> bool:
+    """True if the reference would represent `node` as a `type: 'path'`.
+
+    A bare name and a dotted path, plus either carrying stages. **Not** a
+    bare `*`, `**` or `%`: processAST wraps a *name* into a one-step path
+    and leaves a wildcard as itself, so `nums{...}[0]` is legal while
+    `*{...}[0]` is S0209. Several rules turn on this distinction rather
+    than on what the node evaluates to -- which stage placements are
+    legal, and whether a `[]` mark survives a sort.
+    """
+    if isinstance(node, (PathExpr, FieldRef)):
+        return True
+    if isinstance(node, (PredicateExpr, ArraySubscript, SortExpr, ForceArray)):
+        return is_path_node(node.source)
+    return False
+
+
+def mark_survives_sort(node: AstNode) -> bool:
+    """True if a `[]` on `node` still keeps its singleton through a `^(...)`.
+
+    `^(...)` wraps its source in a path of its own, and only the `.`
+    production promotes a step's `keepArray` to that path -- so the mark
+    rides through the sort when what carries it is itself path-shaped, and
+    is dropped otherwise. Measured, not assumed: `a.b[]^($)` and
+    `nums[0][]^($)` keep their array, while `$map(one,f)[]^($)`,
+    `$distinct(one)[]^($)` and `(a.b)[0][]^($)` all collapse.
+    """
+    return is_path_node(node)
+

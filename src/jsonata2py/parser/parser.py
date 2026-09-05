@@ -69,6 +69,8 @@ from .ast_nodes import (
     VariableBinding,
     VariableRef,
     WildcardStep,
+    is_path_node,
+    yields_sequence,
 )
 from .lexer import Lexer
 from .tokens import Token, TokenType
@@ -174,6 +176,8 @@ class Parser:
                 if inner.type == TokenType.QUESTION:
                     raise ParseError("T1008", "The expression is not a function", t.position)
                 raise ParseError("T1006", "The expression is not a function", t.position)
+            if t.type == TokenType.DOT_DOT:
+                raise ParseError("S0201", "Syntax error: '..'", t.position)
             raise ParseError("S0211", f"Unexpected token '{t.value}'", t.position)
         return result
 
@@ -268,11 +272,14 @@ class Parser:
         """Level 10: unary - and not."""
         if self._peek().type == TokenType.MINUS:
             self._consume(TokenType.MINUS)
-            # Negative number literal optimisation
+            # Negative number literal optimisation. The literal still has to
+            # flow through the postfix and chain levels: `-` binds tighter
+            # than `~>` in the reference, so `-1 ~> $string` is `"-1"` -- and
+            # returning here left the `~>` unconsumed and unparseable.
             if self._peek().type == TokenType.NUMBER:
                 v = _parse_double(self._peek().value, self._peek().position)
                 self.cursor += 1
-                return NumberLiteral(-v)
+                return self._parse_chain(self._parse_postfix(NumberLiteral(-v)))
             return UnaryMinus(self._parse_unary())
         if self._peek().type == TokenType.NOT:
             self._consume(TokenType.NOT)
@@ -283,25 +290,47 @@ class Parser:
             return FunctionCall("not", [arg])
         return self._parse_chain()
 
-    def _parse_chain(self) -> AstNode:
+    def _parse_chain(self, left: AstNode | None = None) -> AstNode:
         """Level 11: ~> function chaining."""
-        left = self._parse_postfix()
-        if self._peek().type == TokenType.TILDE_GT:
-            steps: list[AstNode] = [left]
+        if left is None:
+            left = self._parse_postfix()
+        if self._peek().type != TokenType.TILDE_GT:
+            return left
+        # A `~>` step does not take a trailing `@$v`/`#$v` of its own: the
+        # binding applies to the whole chain. `a ~> $string() @$e` binds the
+        # *stringified* `a` -- attaching `@$e` to `$string()` instead left a
+        # bare function where a value belonged, which was T2006. A binding on
+        # the chain's *first* operand still binds there
+        # (`a@$e ~> $string()` stringifies the document).
+        node: AstNode = left
+        while self._peek().type == TokenType.TILDE_GT:
+            steps: list[AstNode] = list(node.steps) if isinstance(node, ChainExpr) else [node]
             while self._peek().type == TokenType.TILDE_GT:
                 self._consume(TokenType.TILDE_GT)
-                steps.append(self._parse_postfix())
-            return ChainExpr(steps)
-        return left
+                steps.append(self._parse_postfix(allow_bindings=False))
+            node = ChainExpr(steps)
+            while (
+                self._peek().type in (TokenType.AT, TokenType.HASH)
+                and self._peek_at(1).type == TokenType.VARIABLE
+            ):
+                is_at = self._peek().type == TokenType.AT
+                var_name = self._peek_at(1).value
+                self.cursor += 2
+                node = _append_binding(node, ContextBinding(var_name) if is_at else PositionBinding(var_name))
+        return node
 
-    def _parse_postfix(self) -> AstNode:
+    def _parse_postfix(self, left: AstNode | None = None, allow_bindings: bool = True) -> AstNode:
         """Level 12: postfix -- . [] ^() {} ||."""
-        node = self._parse_primary()
+        node = self._parse_primary() if left is None else left
 
         while True:
             if self._peek().type == TokenType.DOT:
                 node = self._parse_dot_step(node)
-            elif self._peek().type == TokenType.AT and self._peek_at(1).type == TokenType.VARIABLE:
+            elif (
+                allow_bindings
+                and self._peek().type == TokenType.AT
+                and self._peek_at(1).type == TokenType.VARIABLE
+            ):
                 # Context variable binding: node@$var
                 # S0215: @$var cannot follow a predicate/subscript step
                 if _ends_with_predicate_or_subscript(node):
@@ -319,17 +348,21 @@ class Parser:
                     )
                 var_name = self._peek_at(1).value
                 self.cursor += 2  # consume AT and VARIABLE
-                node = _append_to_path(node, ContextBinding(var_name))
-            elif self._peek().type == TokenType.AT:
+                node = _append_binding(node, ContextBinding(var_name))
+            elif allow_bindings and self._peek().type == TokenType.AT:
                 # AT not followed by $var -- must use a variable name (S0214)
                 t = self._peek()
                 raise ParseError("S0214", "The operand of the '@' operator must be a variable name ($var)", t.position)
-            elif self._peek().type == TokenType.HASH and self._peek_at(1).type == TokenType.VARIABLE:
+            elif (
+                allow_bindings
+                and self._peek().type == TokenType.HASH
+                and self._peek_at(1).type == TokenType.VARIABLE
+            ):
                 # Positional variable binding: node#$var
                 var_name = self._peek_at(1).value
                 self.cursor += 2  # consume HASH and VARIABLE
-                node = _append_to_path(node, PositionBinding(var_name))
-            elif self._peek().type == TokenType.HASH:
+                node = _append_binding(node, PositionBinding(var_name))
+            elif allow_bindings and self._peek().type == TokenType.HASH:
                 # HASH not followed by $var -- must use a variable name (S0214)
                 t = self._peek()
                 raise ParseError("S0214", "The operand of the '#' operator must be a variable name ($var)", t.position)
@@ -408,25 +441,60 @@ class Parser:
                 self._dot_step_pending = False
         # Flatten consecutive dot-steps into a single PathExpr
         steps: list[AstNode] = list(left.steps) if isinstance(left, PathExpr) else [self._as_path_head(left)]
+        # A quoted string heading a path denotes the *field* of that name.
+        # When a binding built the path first (`"z"@$e.$`) the head has not
+        # been through _as_path_head yet, and only the dot makes it a path.
+        if steps:
+            steps[0] = self._as_path_head(steps[0])
         steps.append(right)
-        return PathExpr(steps)
+        # Only the `.` production makes a path, so this is the one place a
+        # literal step is rejected -- see _reject_literal_step.
+        return _new_path(steps, check_literals=True)
+
+    def _peek_after_lbracket_is_rbracket(self) -> bool:
+        """True when the bracket about to be consumed is an empty `[]`."""
+        return (
+            self._peek().type == TokenType.LBRACKET
+            and self.cursor + 1 < len(self.tokens)
+            and self.tokens[self.cursor + 1].type == TokenType.RBRACKET
+        )
 
     def _parse_subscript_or_predicate(self, source: AstNode) -> AstNode:
+        if isinstance(source, GroupByExpr) and self._peek_after_lbracket_is_rbracket():
+            # `[]` never reaches the S0209 check: the reference sets
+            # keepArray on the node in its own production, not through the
+            # `[` infix that raises S0209. And a group-by's result is an
+            # object, never a sequence, so the mark can never fire.
+            self._consume(TokenType.LBRACKET)
+            self._consume(TokenType.RBRACKET)
+            return ForceArray(source, False)
         if isinstance(source, GroupByExpr):
-            t = self._peek()
-            raise ParseError("S0209", "A predicate cannot be applied to a group-by expression", t.position)
+            # S0209 is narrower than "a stage after a group-by". The
+            # reference reads the group off the *last step* of a path and
+            # off the node itself otherwise -- so `nums{...}[0]` is legal
+            # (the group hangs on the path, and evaluatePath runs it last,
+            # after the stage) while `[1,2,3]{...}[true]` is S0209 (the
+            # group hangs on the constructor, which is where the stage
+            # would have to go).
+            if not is_path_node(source.source):
+                t = self._peek()
+                raise ParseError(
+                    "S0209", "A predicate cannot be applied to a group-by expression", t.position
+                )
+            return replace(source, source=self._parse_subscript_or_predicate(source.source))
         self._consume(TokenType.LBRACKET)
         if self._peek().type == TokenType.RBRACKET:
-            # Empty [] -- force-array operator: wraps the result in an array
+            # Empty [] -- force-array operator. Whether it does anything
+            # here depends on whether `source` builds a sequence; when it
+            # does not, the mark is recorded and fires on the next stage.
             self._consume(TokenType.RBRACKET)
-            return ForceArray(source)
-        # Range expression inside brackets: [from..to]
+            return ForceArray(source, yields_sequence(source))
         inner = self._parse_expression()
-        if self._peek().type == TokenType.DOT_DOT:
-            self._consume(TokenType.DOT_DOT)
-            to = self._parse_expression()
-            self._consume(TokenType.RBRACKET)
-            return PredicateExpr(source, RangeExpr(inner, to))
+        # `..` is parsed *only* by the array-constructor production in the
+        # reference, so as a predicate it never becomes a slice: the parser
+        # is looking for `]` and reports S0202 on the `..` it finds instead.
+        # `a.b[0..1]` was an extension of this port's, and all three ports
+        # shared it -- see section 14.4 of the cross-port notes.
         self._consume(TokenType.RBRACKET)
         if isinstance(inner, NumberLiteral):
             # a.b[n] -- fold the subscript into the last path step so it is
@@ -437,7 +505,7 @@ class Parser:
                 steps = list(source.steps)
                 last_step = steps.pop()
                 steps.append(ArraySubscript(last_step, inner))
-                return PathExpr(steps)
+                return _new_path(steps)
             # a.b.c[pred][n] -- fold when source is a PredicateExpr on a PathExpr,
             # so [n] is applied per-element (per-b), not on the globally collected
             # result.
@@ -446,11 +514,26 @@ class Parser:
                 steps = list(pp.steps)
                 last_step = steps.pop()
                 steps.append(ArraySubscript(PredicateExpr(last_step, source.predicate), inner))
-                return PathExpr(steps)
+                return _new_path(steps)
             return ArraySubscript(source, inner)
         # Non-numeric predicate: for positional-binding or context-binding paths
         # (ending in #$var or @$var), fold the predicate as a path step so that
         # $i / $var is in scope during filtering.
+        if (
+            isinstance(source, PathExpr)
+            and len(source.steps) > 1
+            and _is_index_shaped(inner)
+        ):
+            # An index-shaped predicate folds onto the last step, exactly as
+            # the bare numeric subscript above does: `objs.t[[0]]` is the
+            # first `t` of each `objs`, not the first of the flattened
+            # result. It is the one predicate shape that can tell per-step
+            # from per-path apart -- a boolean one gives the same answer
+            # either way, and folding those wholesale regresses this port's
+            # own per-element scoping.
+            steps = list(source.steps)
+            steps[-1] = PredicateExpr(steps[-1], inner)
+            return _new_path(steps)
         if isinstance(source, PathExpr):
             path_steps = source.steps
             last_step = path_steps[-1]
@@ -458,10 +541,15 @@ class Parser:
                 # Fold as a PredicateExpr path step so the binding is traversed first
                 steps = list(path_steps)
                 steps.append(PredicateExpr(ContextRef(), inner))
-                return PathExpr(steps)
+                return _new_path(steps)
         return PredicateExpr(source, inner)
 
     def _parse_sort_expr(self, source: AstNode) -> AstNode:
+        if isinstance(source, GroupByExpr) and is_path_node(source.source):
+            # Same rule as a stage: the group runs after the sort, over what
+            # the sort produced. `objs{"k":$string($)}^($)` therefore sorts
+            # the objects and raises T2008, rather than grouping first.
+            return replace(source, source=self._parse_sort_expr(source.source))
         self._consume(TokenType.CARET)
         self._consume(TokenType.LPAREN)
         keys: list[SortKey] = []
@@ -847,13 +935,131 @@ class Parser:
         return False
 
 
+def _flag_consarray_head(step: AstNode) -> AstNode:
+    """Marks an array constructor heading a path with `path_head=True`.
+
+    Reaches through every stage the head can carry -- a sort, a predicate,
+    a subscript, a `[]` or a group-by -- because all of those hang *off*
+    the constructor in the reference, which still sees it as `steps[0]`.
+    `[1][0].x` is flagged; `([1])[0].x` is not, and that parenthesis is the
+    only thing separating them, which is why this has to happen here.
+    """
+    if isinstance(step, ArrayConstructor):
+        return step if step.path_head else replace(step, path_head=True)
+    if isinstance(step, (SortExpr, ArraySubscript, PredicateExpr, GroupByExpr, ForceArray)):
+        source = _flag_consarray_head(step.source)
+        return step if source is step.source else replace(step, source=source)
+    return step
+
+
+def _new_path(steps: list[AstNode], check_literals: bool = False) -> PathExpr:
+    """Builds a PathExpr, flagging an array constructor at its head.
+
+    Every PathExpr must be built through here: the flag records a
+    *syntactic* property that only the parser can see, since the optimizer
+    strips the `Parenthesized` wrapper that separates `([]).x` from `[].x`.
+    """
+    if len(steps) > 1 and check_literals:
+        # Both of these belong to the `.` production alone. The reference
+        # sets `consarray` in processAST's `case '.'`, so a path a *binding*
+        # built never carries it -- and that is the difference between
+        # `[1,2]#$i@$e`, which is the context once per constructor element,
+        # and `[1,2]#$i@$e.$`, where the dot makes a path, the head
+        # short-circuits as a value, and the stream restarts from the input.
+        for step in steps:
+            _reject_literal_step(step)
+        head = _flag_consarray_head(steps[0])
+        if head is not steps[0]:
+            steps = [head, *steps[1:]]
+    return PathExpr(steps)
+
+
+#: Literal node types the reference refuses as a path step. Strings are
+#: absent on purpose -- a quoted string step *is* a field name.
+_LITERAL_STEPS: tuple[type[AstNode], ...] = (NumberLiteral, BooleanLiteral, NullLiteral)
+
+
+def _reject_literal_step(step: AstNode) -> None:
+    """S0213 for a literal anywhere in a multi-step path.
+
+    The reference filters the finished step list, so this catches the head
+    as well as anything after a dot -- `1[].$`, `true.x` and `a.true` are
+    all S0213 -- and it reaches through the stages a step carries, because
+    those hang off the literal rather than replacing it.
+
+    It has to happen here rather than after optimisation: constant folding
+    legitimately turns `a.(1+1)` into a literal step, and a parenthesised
+    block is a legal step whatever it folds to.
+    """
+    base = step
+    while isinstance(base, (ForceArray, PredicateExpr, ArraySubscript, SortExpr, GroupByExpr)):
+        base = base.source
+    if isinstance(base, _LITERAL_STEPS):
+        raise ParseError(
+            "S0213",
+            f"The literal value {_literal_text(base)} cannot be used as a step within a path expression",
+            0,
+        )
+
+
+def _literal_text(node: AstNode) -> str:
+    if isinstance(node, NumberLiteral):
+        return str(int(node.value)) if node.value == int(node.value) else str(node.value)
+    if isinstance(node, BooleanLiteral):
+        return "true" if node.value else "false"
+    return "null"
+
+
+def _is_index_shaped(node: AstNode) -> bool:
+    """True for a predicate that can only ever select by index.
+
+    `[[0]]` and `[[0,2]]` -- an array of number *literals*, which the
+    reference's `isArrayOfNumbers` gate reads as indices.
+
+    A range (`[[0..1]]`) is deliberately excluded even though the reference
+    folds it too: it reaches here already unwrapped to a RangeExpr, and
+    folding that shape breaks two official-suite cases in this port
+    (`$.$[[0..2]]` and the `transform` group). One row, measured, left.
+    """
+    if not isinstance(node, ArrayConstructor) or not node.elements:
+        return False
+    return all(isinstance(el, NumberLiteral) for el in node.elements)
+
+
 def _ends_with_predicate_or_subscript(node: AstNode) -> bool:
     """Returns True if the node's last path step is a predicate or numeric
-    subscript."""
+    subscript.
+
+    Reaches through the things that can sit *between* the stage and the
+    binding without hiding it -- a `[]`, a group-by, an earlier binding --
+    because the reference reports S0215 for all of them:
+    `nums[0][]@$e`, `nums[0]{...}@$e` and `nums[0]#$i@$e` are each one.
+    """
     last = node
     if isinstance(node, PathExpr) and node.steps:
         last = node.steps[-1]
+    while isinstance(last, (ForceArray, GroupByExpr, ContextBinding, PositionBinding)):
+        if isinstance(last, (ContextBinding, PositionBinding)):
+            if not isinstance(node, PathExpr) or len(node.steps) < 2:
+                return False
+            last = node.steps[-2]
+            continue
+        last = last.source
     return isinstance(last, (PredicateExpr, ArraySubscript))
+
+
+def _append_binding(node: AstNode, step: AstNode) -> AstNode:
+    """Appends an `@$v`/`#$v` binding, pushing it inside a group-by.
+
+    `@` sets the focus on the last *step* of the path it follows, and
+    evaluatePath runs the group last -- over the tuple stream the binding
+    produced. So `a{"k":$string($)}@$e` groups the *reverted* context (the
+    document), not `a`'s value. Same rule as a stage written to the right of
+    a group-by, which the parser already pushes inside.
+    """
+    if isinstance(node, GroupByExpr) and is_path_node(node.source):
+        return replace(node, source=_append_to_path(node.source, step))
+    return _append_to_path(node, step)
 
 
 def _append_to_path(node: AstNode, step: AstNode) -> AstNode:
@@ -861,10 +1067,13 @@ def _append_to_path(node: AstNode, step: AstNode) -> AstNode:
 
     If node is already a PathExpr, the step is added to its list.
     Otherwise, a new two-element PathExpr is created.
+
+    Literals are not re-checked here: only the `.` production makes a path in
+    the reference, so `1@$e` is `1` while `1@$e.$e` is S0213.
     """
     steps: list[AstNode] = list(node.steps) if isinstance(node, PathExpr) else [node]
     steps.append(step)
-    return PathExpr(steps)
+    return _new_path(steps)
 
 
 def _has_invalid_parametrized_type(sig: str) -> bool:

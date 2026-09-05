@@ -27,6 +27,12 @@ def fn_sort(arg: Any, key_fn: Callable[[Any], Any] | None) -> Any:
     items = list(arg)
     if not items:
         return arg
+    if len(items) < 2:
+        # The reference merge-sorts, so with nothing to compare it never
+        # evaluates a key and never reports a bad one: `[[1]]^($)` is `[1]`
+        # and `$sort([[1]])` is `[[1]]`, not T2008 / D3070. Validating a
+        # lone element made a working expression throw.
+        return items
     if key_fn is None:
         for elem in items:
             if isinstance(elem, (dict, list)):
@@ -229,23 +235,28 @@ def fn_collect_triples(grandparents: Any, parent_fn: Callable[[Any], Any], elem_
 
 
 def fn_shuffle(arg: Any) -> Any:
+    """`$shuffle`. Its signature is `<a:a>`, so a non-array argument is
+    array-wrapped by the coercion rules rather than passed through --
+    `$shuffle(1)` is `[1]`, the same rule `$reverse` already followed."""
     if arg is MISSING:
         return MISSING
     if not isinstance(arg, list):
-        return arg
+        return [arg]
     items = list(arg)
     random.shuffle(items)
     return items
 
 
 def fn_map(arr: Any, fn: Callable[[Any], Any]) -> Any:
+    """`$map`. An element whose callback yields nothing contributes nothing:
+    the reference builds the result with createSequence and pushes only a
+    defined value, so `$map(nums, function($v){$v>1 ? $v : nope})` is
+    `[2,3]`, not a three-element result with a hole in it."""
     fn = _core.deadline_guard(fn)
     if arr is MISSING:
         return MISSING
-    if isinstance(arr, list):
-        result = [fn(elem) for elem in arr]
-    else:
-        result = [fn(arr)]
+    items = arr if isinstance(arr, list) else [arr]
+    result = [val for elem in items if (val := fn(elem)) is not MISSING]
     return _core.unwrap(result)
 
 
@@ -289,7 +300,9 @@ def fn_map_indexed(arr: Any, fn: Callable[[Any], Any]) -> Any:
         val = fn([item, i, arr])
         if val is not MISSING:
             result.append(val)
-    return result
+    # A sequence, so a lone result collapses -- exactly as the one-parameter
+    # form already did. `$map(one, function($v,$i){$i})` is `0`, not `[0]`.
+    return _core.unwrap(result)
 
 
 def fn_filter_indexed(arr: Any, predicate: Callable[[Any], Any]) -> Any:

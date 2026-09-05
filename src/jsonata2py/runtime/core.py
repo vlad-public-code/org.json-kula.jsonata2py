@@ -22,6 +22,7 @@ from __future__ import annotations
 import json as _json_module
 import math
 from collections.abc import Callable
+from functools import lru_cache
 from types import ModuleType
 from typing import Any, cast
 
@@ -31,14 +32,26 @@ from .context import DEADLINE_STACK as _DEADLINE_STACK
 from .values import MISSING, JLambda, JRegex, Preserved, is_function, is_number, is_regex
 
 __all__ = [
-    # value model re-exports
     "MISSING",
     "NULL",
+    "RESCAN",
     "JLambda",
     "JRegex",
     "Preserved",
     "RangeHolder",
     # arithmetic
+    # array / sequence builtins
+    # bindings support (thin delegations to context.py)
+    # chain / lambda / regex
+    # constructors
+    # date/time
+    # factory / path navigation
+    # internal helpers referenced by generated code
+    # object builtins
+    # string builtins
+    # string concat / comparisons / boolean logic
+    # type coercion / scalar builtins
+    # value model re-exports
     "add",
     "and_",
     "apply_step",
@@ -50,12 +63,14 @@ __all__ = [
     "clamp_index",
     "coalesce",
     "collect_pos_tuples",
-    # string concat / comparisons / boolean logic
     "concat",
+    "consarray_head",
+    "constructor_step_final",
+    "constructor_step_keep_singleton",
+    "context_step",
     "deadline_guard",
     "deep_equals",
     "descendant",
-    # internal helpers referenced by generated code
     "discard",
     "div_d",
     "divide",
@@ -65,10 +80,10 @@ __all__ = [
     "elvis",
     "end_evaluation",
     "eq",
-    # factory / path navigation
     "field",
     "field_function",
     "filter_",
+    "filter_field_eq",
     "fn_abs",
     "fn_append",
     "fn_apply",
@@ -86,7 +101,6 @@ __all__ = [
     "fn_collect_pairs",
     "fn_collect_triples",
     "fn_contains",
-    # array / sequence builtins
     "fn_count",
     "fn_count_field",
     "fn_count_field_eq",
@@ -109,7 +123,6 @@ __all__ = [
     "fn_formatNumber",
     "fn_fromMillis",
     "fn_join",
-    # object builtins
     "fn_keys",
     "fn_length",
     "fn_length_ctx",
@@ -125,12 +138,10 @@ __all__ = [
     "fn_min",
     "fn_min_field",
     "fn_not",
-    # date/time
     "fn_now",
     "fn_number",
     "fn_pad",
     "fn_parseInteger",
-    # chain / lambda / regex
     "fn_pipe",
     "fn_power",
     "fn_random",
@@ -141,6 +152,7 @@ __all__ = [
     "fn_round",
     "fn_shuffle",
     "fn_sift",
+    "fn_signature_error",
     "fn_single",
     "fn_single_indexed",
     "fn_sort",
@@ -149,7 +161,6 @@ __all__ = [
     "fn_split",
     "fn_spread",
     "fn_sqrt",
-    # type coercion / scalar builtins
     "fn_string",
     "fn_substring",
     "fn_substringAfter",
@@ -163,12 +174,13 @@ __all__ = [
     "fn_transform",
     "fn_trim",
     "fn_type",
-    # string builtins
     "fn_uppercase",
     "fn_values",
     "fn_zip",
     "force_array",
+    "force_array_cons",
     "ge",
+    "group_context",
     "gt",
     "in_",
     "is_evaluation_active",
@@ -181,13 +193,17 @@ __all__ = [
     "is_truthy",
     "json_encode_compact",
     "json_encode_pretty",
+    "keep_singleton",
     "lambda_arity",
     "lambda_value",
     "le",
     "lt",
+    "map_consarray_step",
     "map_constructor_step",
     "map_constructor_step_flat",
+    "map_group_step",
     "map_step",
+    "matches_index_or_truthy",
     "merge_group_by_objects",
     "missing",
     "mod_d",
@@ -205,17 +221,19 @@ __all__ = [
     "number_to_string",
     "object_",
     "object_of",
+    "object_of_distinct",
     "or_",
-    # constructors
     "pack_args",
     "preserve_array",
     "range_",
     "range_flatten",
     "range_subscript",
     "regex_value",
-    # bindings support (thin delegations to context.py)
+    "require_function",
     "resolve_binding",
     "sanitize_for_string",
+    "staged_consarray_head",
+    "step_final",
     "subscript",
     "subtract",
     "to_number",
@@ -223,6 +241,7 @@ __all__ = [
     "tuple2",
     "tuple_callback",
     "unwrap",
+    "unwrap_cons",
     "wildcard",
     "wildcard_context",
 ]
@@ -529,19 +548,63 @@ def _collect_descendants(node: Any, acc: list[Any]) -> None:
 
 def force_array(node: Any) -> Any:
     """Forces node to be a list, wrapping it in a single-element list if
-    not already one. Implements the expr[] operator."""
-    if node is None or node is MISSING:
+    not already one. Implements the expr[] operator.
+
+    A JSON `null` is a value, not an absence: the reference pushes it into
+    a sequence like any other and `[null][0]` is `null`. Only MISSING is
+    absent here -- navigation is the place that treats the two alike
+    (`null.x` really is undefined), and that lives in field().
+    """
+    if node is MISSING:
         return MISSING
     if isinstance(node, list):
         return node
     return [node]
 
 
+class _Rescan:
+    """Marks a fused-scan slot whose fast arm did not apply.
+
+    A fused sequence scan (see translator/scan_fusion.py) handles only the
+    arm every real document takes -- a field holding a plain int or float.
+    The moment it sees anything else it stops trying to be clever and hands
+    the slot back as this sentinel; the use site then falls back to the
+    original per-operation helper, at its original position, so the unusual
+    case is handled by the code that already handles it.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "RESCAN"
+
+
+RESCAN = _Rescan()
+
+
+def force_array_cons(node: Any) -> Any:
+    """`expr[]` over a path whose value may be a constructor's own array.
+
+    An empty array here is the head short-circuit's `cons` result -- a
+    single value, not a sequence -- so `[]` promotes it rather than passing
+    it through: `a.([].x)[]` is `[[]]`. Any other value is an ordinary
+    sequence and force_array applies unchanged, so `nums.([].x)[]` stays
+    `[[],[],[]]`.
+
+    Testing the value is sound for the same reason it is in
+    map_consarray_step: every empty result that is *not* the short-circuit
+    has already collapsed to MISSING before it gets here.
+    """
+    if isinstance(node, list) and not node:
+        return [node]
+    return force_array(node)
+
+
 def filter_(seq: Any, predicate: Callable[[Any], Any]) -> Any:
     """Filters seq by predicate, preserving elements for which the
     predicate returns a truthy value."""
     predicate = deadline_guard(predicate)
-    if seq is None or seq is MISSING:
+    if seq is MISSING:
         return MISSING
     if not isinstance(seq, list):
         return seq if is_truthy(predicate(seq)) else MISSING
@@ -568,39 +631,132 @@ def filter_(seq: Any, predicate: Callable[[Any], Any]) -> Any:
     return single if have_single else MISSING
 
 
-def dynamic_filter(seq: Any, predicate: Callable[[Any], Any]) -> Any:
-    """Dynamic filter: probes the predicate with MISSING to determine
-    mode. If the result is a number -> index subscript; otherwise ->
-    boolean filter."""
+def filter_field_eq(seq: Any, field_name: str, expected: Any) -> Any:
+    """`$seq[field = <literal>]` used as a value.
+
+    The value-producing twin of fn_count_field_eq, monomorphized on the
+    expected value's kind for the same reason: the generic shape reaches the
+    comparison through a callback, a `field()` call and `eq()` per element,
+    and none of that indirection is free in CPython.
+
+    Also the fallback the fused sequence scan (translator/scan_fusion.py)
+    redirects to when its fast arm does not apply, which is why it must be a
+    plain call taking the field name and literal rather than a callback --
+    the scan has no compiled predicate to hand back.
+
+    The lazy single/array pair is load-bearing, not an optimisation: JSONata
+    returns nothing for no matches, the element itself for exactly one, and
+    an array only for several, and most filters select one element.
+    """
     if seq is None or seq is MISSING:
         return MISSING
-    probe = predicate(MISSING)
-    if probe is not None and probe is not MISSING:
-        if is_number(probe):
-            return subscript(seq, probe)
-        if isinstance(probe, list):
-            all_ints = all(is_number(idx) for idx in probe)
-            if all_ints:
-                size = len(seq) if isinstance(seq, list) else 1
-                indices: set[int] = set()
-                for idx in probe:
-                    i = int(idx)
-                    actual = size + i if i < 0 else i
-                    if 0 <= actual < size:
-                        indices.add(actual)
-                result = []
-                for i in sorted(indices):
-                    val = seq[i] if isinstance(seq, list) else (seq if i == 0 else MISSING)
-                    if val is not MISSING:
-                        result.append(val)
-                return _unwrap_list(result)
-    return filter_(seq, predicate)
+    if not isinstance(seq, list):
+        return seq if _field_eq(seq, field_name, expected) else MISSING
+    result: list[Any] | None = None
+    single: Any = None
+    have_single = False
+    for elem in seq:
+        if not _field_eq(elem, field_name, expected):
+            continue
+        if result is not None:
+            result.append(elem)
+        elif not have_single:
+            single = elem
+            have_single = True
+        else:
+            result = [single, elem]
+            have_single = False
+    if result is not None:
+        return result
+    return single if have_single else MISSING
+
+
+def _field_eq(elem: Any, field_name: str, expected: Any) -> bool:
+    """`field(elem, name) = expected` for a literal expected value.
+
+    A non-dict element goes the long way round: `field()` maps over a
+    sequence and navigates nulls, and the answer for those shapes is
+    whatever `eq` makes of what it returns.
+    """
+    if elem.__class__ is dict or isinstance(elem, dict):
+        v = elem.get(field_name, MISSING)
+    else:
+        v = field(elem, field_name)
+    if v is MISSING:
+        return False
+    ecls = expected.__class__
+    if ecls is str:
+        return (v.__class__ is str or isinstance(v, str)) and v == expected
+    if ecls is bool:
+        return v is expected
+    if ecls is int or ecls is float:
+        vcls = v.__class__
+        if vcls is int or vcls is float:
+            return float(v) == float(expected)
+        return is_number(v) and float(v) == float(expected)
+    return bool(_deep_equals(v, expected))
+
+
+def dynamic_filter(seq: Any, predicate: Callable[[Any], Any]) -> Any:
+    """`[expr]` where the predicate is not statically boolean.
+
+    The reference decides index-versus-boolean **per element, on that
+    element's own result** -- a number (or an array in which *every* value
+    is a number) selects by 0-based index, anything else is a truthiness
+    test. Probing the predicate once with an absent context instead, which
+    is what this did, gets a predicate that reads the element wrong:
+    `objs[x]` over `[{"x":1},{"x":2},{"x":3}]` is *undefined*, because each
+    element's own `x` is an index that never equals its own position, and
+    the probe saw only MISSING and fell back to a boolean filter.
+
+    A predicate the translator can prove boolean never reaches here -- it
+    compiles to `filter_` -- so this is not on the hot path.
+    """
+    if seq is MISSING:
+        return MISSING
+    predicate = deadline_guard(predicate)
+    items = seq if isinstance(seq, list) else [seq]
+    n = len(items)
+    result = [item for i, item in enumerate(items) if matches_index_or_truthy(predicate(item), i, n)]
+    return _unwrap_list(result)
+
+
+def matches_index_or_truthy(res: Any, index: int, length: int) -> bool:
+    """One predicate result, as the reference's `evaluateFilter` reads it.
+
+    A number selects by 0-based index, negatives counting from the end. An
+    array does too, but only when *every* element is a number -- the
+    reference's `isArrayOfNumbers` gate is all-or-nothing, so one stray
+    non-number disqualifies every number in it.
+    """
+    if res is True:
+        return True
+    if res is False or res is MISSING:
+        return False
+    if isinstance(res, (int, float)) and not isinstance(res, bool):
+        idx = int(res)
+        return (length + idx if idx < 0 else idx) == index
+    if not isinstance(res, list):
+        return is_truthy(res)
+    if res and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in res):
+        for v in res:
+            idx = int(v)
+            if (length + idx if idx < 0 else idx) == index:
+                return True
+        return False
+    return is_truthy(res)
 
 
 def subscript(seq: Any, index: Any) -> Any:
     """Returns the element at index (zero-based, negatives count from
-    end)."""
-    if seq is None or seq is MISSING:
+    end).
+
+    A JSON `null` is a value, not an absence: the reference pushes it into
+    a sequence like any other and `[null][0]` is `null`. Only MISSING is
+    absent here -- navigation is the place that treats the two alike
+    (`null.x` really is undefined), and that lives in field().
+    """
+    if seq is MISSING:
         return MISSING
     i = int(to_number(index))
     if not isinstance(seq, list):
@@ -612,8 +768,14 @@ def subscript(seq: Any, index: Any) -> Any:
 
 def range_subscript(seq: Any, from_: Any, to: Any) -> Any:
     """Returns a sub-array containing elements at indices from through to
-    (inclusive, zero-based, negatives count from end)."""
-    if seq is None or seq is MISSING:
+    (inclusive, zero-based, negatives count from end).
+
+    A JSON `null` is a value, not an absence: the reference pushes it into
+    a sequence like any other and `[null][0]` is `null`. Only MISSING is
+    absent here -- navigation is the place that treats the two alike
+    (`null.x` really is undefined), and that lives in field().
+    """
+    if seq is MISSING:
         return MISSING
     if not isinstance(seq, list):
         f = int(to_number(from_))
@@ -630,17 +792,25 @@ def range_subscript(seq: Any, from_: Any, to: Any) -> Any:
 
 
 def apply_step(node: Any, fn: Callable[[Any], Any]) -> Any:
-    """Applies fn with the element as the new context."""
-    if node is None or node is MISSING:
+    """Applies fn with the element as the new context.
+
+    A JSON `null` is a context like any other -- `n.$string($)` is
+    `"null"` -- so only MISSING short-circuits.
+    """
+    if node is MISSING:
         return MISSING
     return fn(node)
 
 
 def map_step(node: Any, fn: Callable[[Any], Any]) -> Any:
     """Maps fn over every element of a sequence, collecting non-missing
-    results. Used for subscript steps inside path expressions."""
+    results. Used for subscript steps inside path expressions.
+
+    A JSON `null` is a context like any other, so only MISSING
+    short-circuits.
+    """
     fn = deadline_guard(fn)
-    if node is None or node is MISSING:
+    if node is MISSING:
         return MISSING
     if isinstance(node, list):
         result: list[Any] = []
@@ -650,6 +820,76 @@ def map_step(node: Any, fn: Callable[[Any], Any]) -> Any:
                 _append_to_sequence(result, val)
         return _unwrap_list(result)
     return fn(node)
+
+
+def consarray_head(head: Any, rest: Callable[[Any], Any]) -> Any:
+    """Guards a path whose first step is an array constructor.
+
+    The reference evaluates such a head as a *value* instead of iterating
+    it, and breaks out of the step loop as soon as a step yields nothing --
+    so an empty constructor is the path's whole result, the remaining steps
+    never run, and the empty array escapes the sequence collapse because a
+    constructor result is not marked as a sequence. `[].x` is therefore
+    `[]` while `([]).x`, `empty.x` and `($e := []; $e.x)` are all undefined.
+
+    `rest` is a thunk, not an already-evaluated value: `[].($error("boom"))`
+    must succeed, so the remaining steps genuinely must not run.
+
+    A MISSING head counts as empty. The translator only emits this call
+    when the head is statically an array constructor -- which always
+    produces an array -- so the only way it can arrive absent is a wrapper
+    (`unwrap`, after `[]^(k).x`) having already collapsed the empty one.
+    """
+    if head is MISSING or (isinstance(head, list) and not head):
+        return []
+    return rest(head)
+
+
+def staged_consarray_head(head: Any, rest: Callable[[Any], Any]) -> Any:
+    """Guards the step after a constructor head that carried a stage.
+
+    §1's short-circuit returns the head as a *value*, and the reference's
+    next step iterates it (`for (ii < input.length)`). A stage or a group can
+    leave that value a scalar or an object, which has no length, so the loop
+    runs zero times and the path is undefined -- `[1][0]` is `1` but
+    `[1][0].$` is not.
+    """
+    if not isinstance(head, list):
+        return MISSING
+    return rest(head)
+
+
+def step_final(node: Any, fn: Callable[[Any], Any]) -> Any:
+    """A generic expression step in TERMINAL position.
+
+    Identical to map_step except that a *single* raw result passes through
+    verbatim instead of being flattened -- the reference's terminal-step
+    rule (`lastStep && result.length === 1 && Array.isArray(result[0])`).
+    Only an empty array can tell the two apart in practice: flattening one
+    contributes nothing and collapses the whole path to undefined, where the
+    reference returns the array. `objs.($zip(one, two))` is `[]`, not
+    undefined.
+
+    Two or more results flatten and collapse exactly as map_step does.
+    A JSON `null` is a context like any other, so only MISSING
+    short-circuits.
+    """
+    fn = deadline_guard(fn)
+    if node is MISSING:
+        return MISSING
+    if not isinstance(node, list):
+        return fn(node)
+    raw: list[Any] = []
+    for elem in node:
+        val = fn(elem)
+        if val is not MISSING:
+            raw.append(val)
+    if len(raw) == 1:
+        return raw[0]
+    result: list[Any] = []
+    for val in raw:
+        _append_to_sequence(result, val)
+    return _unwrap_list(result)
 
 
 def call_field_step(node: Any, invoke: Callable[[Any], Any]) -> Any:
@@ -694,12 +934,25 @@ def field_function(node: Any, name: str, builtin_name: bool) -> Any:
     return fn
 
 
+def map_group_step(node: Any, fn: Callable[[Any], Any]) -> Any:
+    """map_constructor_step for an *object* constructor step.
+
+    Identical, except that each item is passed through group_context first:
+    `{...}` is a group expression, so an item that is itself an array is
+    grouped over its own elements. `nested.{"k":$}` over `[[1,2],[3]]` is
+    `[{"k":[1,2]},{"k":3}]` -- the single-element item collapses, which is
+    the only thing separating this from map_constructor_step.
+    """
+    return map_constructor_step(node, lambda item: fn(group_context(item)))
+
+
 def map_constructor_step(node: Any, fn: Callable[[Any], Any]) -> Any:
     """Maps fn over every element of a sequence and collects results
     without flattening. Used for array/object constructor steps inside
-    path expressions."""
+    path expressions. A JSON `null` is a context like any other, so only
+    MISSING short-circuits."""
     fn = deadline_guard(fn)
-    if node is None or node is MISSING:
+    if node is MISSING:
         return MISSING
     if isinstance(node, list):
         result: list[Any] = []
@@ -714,10 +967,117 @@ def map_constructor_step(node: Any, fn: Callable[[Any], Any]) -> Any:
     return _unwrap_preserve(val)
 
 
+def map_consarray_step(node: Any, fn: Callable[[Any], Any]) -> Any:
+    """Maps a *sub-path led by an array constructor* over a sequence.
+
+    Differs from map_step in one case only: an empty array coming back from
+    the sub-path is pushed into the parent sequence whole rather than
+    flattened away. That mirrors the reference, where the array a
+    constructor builds carries a `cons` flag and `evaluateStep` declines to
+    flatten it -- so `nums.([].x)` is `[[],[],[]]`, not the flattened, and
+    therefore empty, and therefore undefined, result map_step would give.
+
+    Testing the *value* rather than tracking a flag is sound here because
+    the head short-circuit is the only way such a sub-path can yield an
+    empty array: every other empty result collapses to MISSING before it
+    gets back. A sub-path that actually ran its later steps returns an
+    ordinary sequence, which flattens as usual -- `nums.([1,2,3].$)` is
+    nine elements, not three arrays.
+
+    The singleton collapse still applies (`objs.([].x)` is `[]`, not
+    `[[]]`), but only on the sequence branch. A non-sequence context is
+    stepped once and its value returned untouched, which is what keeps the
+    empty array alive in `a.([].x)`; `unwrap` would collapse it again.
+    """
+    fn = deadline_guard(fn)
+    if node is None or node is MISSING:
+        return MISSING
+    if not isinstance(node, list):
+        return fn(node)
+    result: list[Any] = []
+    for elem in node:
+        val = fn(elem)
+        if isinstance(val, list) and not val:
+            result.append(val)
+        else:
+            _append_to_sequence(result, val)
+    return _unwrap_list(result)
+
+
+def constructor_step_final(node: Any, fn: Callable[[Any], Any]) -> Any:
+    """An array-constructor step in TERMINAL position.
+
+    Two rules apply here that `unwrap(map_constructor_step(...))` conflates:
+
+    * the constructor result is never flattened into the parent sequence
+      (the reference marks it `cons`), so `nums.[1,2]` keeps three arrays;
+    * a *single* raw result passes through verbatim -- the reference's
+      terminal-step rule, `if (lastStep && result.length === 1 &&
+      Array.isArray(result[0]) && !isSequence(result[0])) resultSequence =
+      result[0]`. That is what makes `a.[]` an empty array rather than
+      undefined, and `a.[1]` the array `[1]` rather than the number 1.
+
+    The verbatim rule is the sequence branch's singleton collapse and the
+    non-sequence branch's "return what the step produced"; both fall out of
+    not running the result through `unwrap`.
+    """
+    fn = deadline_guard(fn)
+    if node is None or node is MISSING:
+        return MISSING
+    if not isinstance(node, list):
+        val = fn(node)
+        return MISSING if val is MISSING else _unwrap_preserve(val)
+    raw: list[Any] = []
+    for elem in node:
+        val = fn(elem)
+        if val is not MISSING:
+            raw.append(_unwrap_preserve(val))
+    return _unwrap_list(raw)
+
+
+def constructor_step_keep_singleton(node: Any, fn: Callable[[Any], Any]) -> Any:
+    """An array-constructor step under a `[]` (keep-singleton) wrapper.
+
+    `evaluatePath`, at the end:
+
+    ```js
+    if (expr.keepSingletonArray) {
+        if (Array.isArray(resultSequence) && resultSequence.cons && !resultSequence.sequence) {
+            resultSequence = environment.base.createSequence(resultSequence);
+        }
+        ...
+    }
+    ```
+
+    A `cons` array is *wrapped* rather than passed through, because `[]`
+    promotes a singleton to an array and the constructor's array is a single
+    value, not a sequence of one. `a.[1][]` is `[[1]]`.
+
+    Which branch produced the value is exactly the cons/sequence
+    distinction: a non-sequence context yields the constructor array itself
+    (cons, so wrap), while a sequence context yields a sequence of them
+    (already a sequence, so leave it). Doing the finalisation and the wrap
+    in one helper is what lets the two be told apart at all -- by value they
+    are both just lists.
+    """
+    fn = deadline_guard(fn)
+    if node is None or node is MISSING:
+        return MISSING
+    if not isinstance(node, list):
+        val = fn(node)
+        return MISSING if val is MISSING else [_unwrap_preserve(val)]
+    raw: list[Any] = []
+    for elem in node:
+        val = fn(elem)
+        if val is not MISSING:
+            raw.append(_unwrap_preserve(val))
+    return raw if raw else MISSING
+
+
 def map_constructor_step_flat(node: Any, fn: Callable[[Any], Any]) -> Any:
     """Variant of map_constructor_step for the non-preserve (flatten)
     case."""
-    if node is None or node is MISSING:
+    if node is MISSING:
         return MISSING
     if isinstance(node, list):
         result: list[Any] = []
@@ -799,6 +1159,7 @@ def modulo(a: Any, b: Any) -> Any:
         return MISSING
     denom = float(b)
     if denom == 0:
+        # See mod_d: NaN is not representable as a value here.
         raise RuntimeEvaluationError("D1001", "Division by zero")
     return num_node(math.fmod(float(a), denom))
 
@@ -889,6 +1250,10 @@ def mod_d(a: float, b: float) -> float:
     if a != a or b != b:
         return _NAN
     if b == 0:
+        # The reference gives NaN here rather than an error. This port has no
+        # NaN *value* -- num_node folds it to "absent" -- so producing one
+        # would turn `$string(1 % 0)` from D3001 into silently nothing, which
+        # is further from the reference than the error is. See section 16.4.
         raise RuntimeEvaluationError("D1001", "Division by zero")
     return math.fmod(a, b)
 
@@ -903,6 +1268,13 @@ def neg_dn(n: Any) -> float:
 
 def fn_throw(code: str, message: str) -> Any:
     raise RuntimeEvaluationError(code, message)
+
+
+def fn_signature_error(argno: int) -> Any:
+    """T0410 for an argument count the signature cannot accept."""
+    raise RuntimeEvaluationError(
+        "T0410", f"Argument {argno} of function does not match function signature"
+    )
 
 
 def fn_arity_error(name: str, expected: int, actual: int) -> Any:
@@ -948,8 +1320,9 @@ def num_node(v: float) -> Any:
 
 
 def concat(a: Any, b: Any) -> Any:
-    if a is MISSING and b is MISSING:
-        return MISSING
+    """`&`. Both sides absent still gives the empty string: the reference
+    casts each operand with `undefined -> ""` before joining, and has no
+    both-absent short-circuit. `$length(nope & nope)` is 0."""
     sa = "" if a is MISSING else to_text(a)
     sb = "" if b is MISSING else to_text(b)
     return sa + sb
@@ -1293,6 +1666,26 @@ def array_of(*elements: Any) -> list[Any]:
             continue
         else:
             result.append(e)
+    return result
+
+
+def object_of_distinct(keys: list[str], values: list[Any]) -> dict[str, Any]:
+    """object_of for a constructor whose literal keys the translator has
+    already proved distinct.
+
+    The duplicate check object_of performs is a dict lookup per key, and it
+    can only ever fire when two *literal* keys collide -- which is a property
+    of the expression text, decidable once at compile time rather than on
+    every evaluation. This is the Python-shaped half of the JVM port's
+    `objectOfDistinct`: there is no per-key node to avoid allocating here, a
+    dict literal being one allocation already, but the check itself is real.
+    """
+    result: dict[str, Any] = {}
+    for k, value in zip(keys, values, strict=True):
+        # None here is JSON null (D1), a real value -- only MISSING, an
+        # unpopulated slot, is skipped.
+        if value is not MISSING:
+            result[k] = value
     return result
 
 
@@ -2330,6 +2723,7 @@ def tuple_callback(fn: Any) -> Callable[[Any], Any]:
 
 def fn_map(arr: Any, fn: Any) -> Any:
     _seq = _sequences()
+    require_function(fn, 2)
     lambda_arity = _lambdas().lambda_arity
 
     if not isinstance(fn, JLambda):
@@ -2343,6 +2737,7 @@ def fn_map(arr: Any, fn: Any) -> Any:
 
 def fn_filter(arr: Any, predicate: Any) -> Any:
     _seq = _sequences()
+    require_function(predicate, 2)
     lambda_arity = _lambdas().lambda_arity
 
     if not isinstance(predicate, JLambda):
@@ -2352,8 +2747,33 @@ def fn_filter(arr: Any, predicate: Any) -> Any:
     return _seq.fn_filter(arr, element_callback(predicate))
 
 
+def require_function(value: Any, argno: int, optional: bool = False) -> Any:
+    """T0410 for a non-function where a built-in's signature demands one.
+
+    The higher-order built-ins compile their callback at the call site
+    rather than receiving it as an ordinary argument, so the translator's
+    inline signature check never sees that position -- `$sort(nums, 1)`
+    reaches the runtime with a number where a comparator belongs. Checking
+    it here is the one place the value actually arrives.
+    """
+    if value is MISSING:
+        # A required function parameter is not satisfied by an absent
+        # argument -- its signature fragment is `f`, which no `m` matches.
+        if optional:
+            return value
+        raise RuntimeEvaluationError(
+            "T0410", f"Argument {argno} of function does not match function signature"
+        )
+    if not is_function(value) and not callable(value):
+        raise RuntimeEvaluationError(
+            "T0410", f"Argument {argno} of function does not match function signature"
+        )
+    return value
+
+
 def fn_single(arr: Any, predicate: Any = MISSING) -> Any:
     _seq = _sequences()
+    require_function(predicate, 2, optional=True)
     lambda_arity = _lambdas().lambda_arity
 
     if predicate is MISSING:
@@ -2367,6 +2787,7 @@ def fn_single(arr: Any, predicate: Any = MISSING) -> Any:
 
 def fn_sift(obj: Any, fn: Any) -> Any:
     _seq = _sequences()
+    require_function(fn, 2, optional=True)
 
     if not isinstance(fn, JLambda):
         return _seq.fn_sift(obj, fn)
@@ -2375,6 +2796,7 @@ def fn_sift(obj: Any, fn: Any) -> Any:
 
 def fn_each(obj: Any, fn: Any) -> Any:
     _seq = _sequences()
+    require_function(fn, 2)
 
     if not isinstance(fn, JLambda):
         return _seq.fn_each(obj, fn)
@@ -2383,6 +2805,7 @@ def fn_each(obj: Any, fn: Any) -> Any:
 
 def fn_sort(arr: Any, fn: Any = MISSING) -> Any:
     _seq = _sequences()
+    require_function(fn, 2, optional=True)
     lambda_arity = _lambdas().lambda_arity
 
     if fn is MISSING:
@@ -2407,6 +2830,7 @@ def fn_sort_by_ordering_key(arr: Any, key_fn: Callable[[Any], Any], descending: 
 
 
 def fn_reduce(arr: Any, fn: Callable[[Any], Any], init: Any = MISSING) -> Any:
+    require_function(fn, 2)
     return _sequences().fn_reduce(arr, fn, init)
 
 
@@ -2419,8 +2843,10 @@ def fn_reduce_dynamic(arr: Any, fn: Any, init: Any = MISSING) -> Any:
     fn_reduce unchecked and was invoked with a 4-element tuple, yielding
     nonsense ([1,2,1,[1,2]]) instead of D3050.
     """
-    if not is_function(fn):
-        raise RuntimeEvaluationError("D3050", "The second argument of $reduce must be a function")
+    # A non-function is a *signature* mismatch (`<afj?:j>` demands `f` at
+    # position 2), which the reference reports as T0410. D3050 is reserved
+    # for a real function whose arity is wrong.
+    require_function(fn, 2)
     if lambda_arity(fn) < 2:
         raise RuntimeEvaluationError(
             "D3050", "The second argument of $reduce must accept at least 2 parameters"
@@ -2747,7 +3173,39 @@ def regex_value(pattern: str, flags: str) -> Any:
 
 
 def resolve_binding(name: str) -> Any:
-    return _ctx.resolve_binding(name)
+    v = _ctx.resolve_binding(name)
+    return v if v is not MISSING else builtin_value(name)
+
+
+@lru_cache(maxsize=256)
+def builtin_value(name: str) -> Any:
+    """A built-in as a first-class value: `$map(x, $abs)`, `x ~> $abs`.
+
+    Every built-in the reference registers is a function value there, so a
+    hand-maintained table of the ones this port happened to need left the
+    rest resolving to nothing -- `$abs` was MISSING, and passing it anywhere
+    silently did nothing. Built from the same signature table the call sites
+    use, so a built-in cannot be in one and not the other.
+    """
+    from ..translator.translator import _BUILTIN_SIGNATURES
+
+    sig = _BUILTIN_SIGNATURES.get(name)
+    fn = globals().get("fn_" + name)
+    if sig is None or fn is None or not callable(fn):
+        return MISSING
+    from .signature import arity_bounds
+
+    bounds = arity_bounds(sig)
+    arity = 1 if bounds is None or bounds[1] <= 0 else bounds[1]
+    if arity == 1:
+        return JLambda(lambda b: fn(b), 1)
+
+    def call(b: Any, _fn: Any = fn, _n: int = arity) -> Any:
+        args = list(b) if isinstance(b, list) else [b]
+        args.extend([MISSING] * (_n - len(args)))
+        return _fn(*args[:_n])
+
+    return JLambda(call, arity)
 
 
 def call_bound_function(name: str, args: list[Any]) -> Any:
@@ -3033,6 +3491,56 @@ def clamp_index(i: int, length: int) -> int:
     return min(i, length)
 
 
+def group_context(node: Any) -> Any:
+    """The context an object constructor's value expressions actually see.
+
+    `{...}` is a *group expression* in the reference, and
+    evaluateGroupExpression iterates its input: an array context is grouped
+    over its **elements**, not treated as one value. With literal keys every
+    element lands in one group, whose data the reference accumulates with
+    fn.append -- so the value context is the append-fold of the elements,
+    which collapses a single-element array (`[3]` becomes `3`) and flattens
+    one level of nesting. For anything that is not an array this is the
+    identity, which is the overwhelmingly common case.
+    """
+    if not isinstance(node, list):
+        return node
+    if not node:
+        return MISSING
+    data = node[0]
+    for item in node[1:]:
+        data = fn_append(data, item)
+    return data
+
+
+def context_step(node: Any, is_last: bool) -> Any:
+    """The `.$` path step: an identity map that is still a *step*.
+
+    `$` re-binds the context to itself, so the per-element result is the
+    element -- but the reference then finalises the step's results like any
+    other step's, and that finalisation spreads an element that is a plain
+    array. `nested.$` over `[[1,2],[3]]` is therefore `[1,2,3]`, not the two
+    inner arrays, which is the only thing separating it from an identity.
+
+    Two arms, both the reference's: a single raw array as the *last* step's
+    only result passes through verbatim (`one.$` over `[[9]]` is `[9]`),
+    and a constructor's own array is `cons` and is never spread.
+    """
+    if node is MISSING:
+        return MISSING
+    if not isinstance(node, list):
+        return node
+    if is_last and len(node) == 1 and isinstance(node[0], list) and not isinstance(node[0], Preserved):
+        return node[0]
+    out: list[Any] = []
+    for res in node:
+        if isinstance(res, list) and not isinstance(res, Preserved):
+            out.extend(res)
+        elif res is not MISSING:
+            out.append(res)
+    return _unwrap_list(out)
+
+
 def _append_to_sequence(acc: list[Any], val: Any) -> None:
     """Adds val to acc, flattening one level of lists (JSONata sequence
     flattening rule)."""
@@ -3053,8 +3561,36 @@ def _unwrap_list(arr: list[Any]) -> Any:
 
 
 def unwrap(node: Any) -> Any:
-    if node is None or node is MISSING:
+    if node is MISSING:
         return MISSING
     if not isinstance(node, list):
         return node
     return _unwrap_list(node)
+
+
+def unwrap_cons(node: Any) -> Any:
+    """unwrap, except that a constructor's own array survives.
+
+    A cons value is not a sequence, so the collapse does not apply to it.
+    Testing for an *empty* list is enough to tell the two apart, for the
+    same reason it is in force_array_cons: every empty result that is not a
+    head short-circuit has already collapsed to MISSING before it gets
+    here. `[].x^($)` is `[]`, while `[1].$^($)` is `1`.
+    """
+    if isinstance(node, list) and not node:
+        return node
+    return unwrap(node)
+
+
+def keep_singleton(node: Any) -> Any:
+    """The collapse a live `[]` mark suppresses -- and the one it does not.
+
+    `keepSingleton` guards only the length-1 arm of the reference's
+    collapse; the length-0 arm still fires, so `a.b[]^($)` is `[1]` while
+    `empty[]^($)` is undefined.
+    """
+    if node is None or node is MISSING:
+        return MISSING
+    if isinstance(node, list) and not node:
+        return MISSING
+    return node

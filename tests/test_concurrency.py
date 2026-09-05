@@ -130,6 +130,120 @@ def test_concurrent_assign_and_evaluate_never_crashes_or_tears():
 
 
 # =============================================================================
+# Two DIFFERENT compiled expressions, evaluated in parallel
+# =============================================================================
+
+
+def test_two_expressions_four_threads_in_parallel():
+    """Four threads, two distinct pre-compiled expressions, interleaved.
+
+    The tests above share one expression between threads, or compile many
+    expressions concurrently and evaluate each once. Neither covers the shape
+    a real service actually runs: a handful of long-lived compiled
+    expressions, called concurrently and *alternately* on the same threads.
+
+    That interleaving is what makes this more than a repeat of the first
+    test. Per-evaluation state (the bindings overlay, the deadline, the call
+    depth) lives in one `contextvars.ContextVar` shared by every expression,
+    so a frame left behind by expression A would be seen by expression B on
+    the same thread, not by another thread. Alternating A/B/A/B within a
+    worker is the only arrangement that exercises that, and the two
+    expressions are given *different binding names* so a leaked frame shows
+    up as a wrong answer rather than a coincidentally-equal one.
+
+    Verified to fail (not merely to pass): replacing the ContextVar with a
+    process-global slot makes every thread read every other thread's
+    `$minQty` and `$sep`, and this assertion reports it immediately.
+    """
+    totals = _FACTORY.compile("$sum(items[qty >= $minQty].(price * qty))")
+    labels = _FACTORY.compile("$join(items[qty >= $minQty].name, $sep)")
+
+    items = [{"name": f"i{i}", "price": i * 2, "qty": i % 6} for i in range(1, 25)]
+    data = {"items": items}
+
+    def expected_total(min_qty: int) -> float:
+        return sum(i["price"] * i["qty"] for i in items if i["qty"] >= min_qty)
+
+    def expected_label(min_qty: int, sep: str) -> object:
+        names = [i["name"] for i in items if i["qty"] >= min_qty]
+        return sep.join(names)
+
+    threads = 4
+    iterations = 250
+    start = threading.Barrier(threads)
+    failures: list[str] = []
+    lock = threading.Lock()
+
+    def worker(tid: int) -> None:
+        min_qty = tid + 1  # a different filter per thread
+        sep = f"<{tid}>"
+        local: list[str] = []
+        start.wait()  # all four genuinely in flight together
+        for _ in range(iterations):
+            got_total = totals.evaluate(data, JsonataBindings().bind_value("minQty", min_qty))
+            if got_total != expected_total(min_qty):
+                local.append(f"t{tid}: total {got_total!r} != {expected_total(min_qty)!r}")
+
+            binds = JsonataBindings().bind_value("minQty", min_qty).bind_value("sep", sep)
+            got_label = labels.evaluate(data, binds)
+            if got_label != expected_label(min_qty, sep):
+                local.append(f"t{tid}: label {got_label!r} != {expected_label(min_qty, sep)!r}")
+        if local:
+            with lock:
+                failures.extend(local)
+
+    workers = [threading.Thread(target=worker, args=(t,)) for t in range(threads)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+
+    assert not failures, failures[:10]
+
+
+def test_two_expressions_four_threads_do_not_see_each_others_bindings():
+    """`$sep` is bound only for the second expression, so its *absence* in
+    the first is the assertion -- an unbound variable in JSONata is simply
+    undefined.
+
+    This catches a strictly different fault from the test above, which is
+    why both are here. That one binds the same names in both expressions, so
+    a lookup that resolved from the wrong frame would still find the right
+    value; only a test where one expression binds a name the other does not
+    can see it. Verified by injection: leaving the per-evaluation frame
+    unpopped *and* letting lookup fall through to the suspended outer frame
+    makes `$sep` visible here, while the test above stays green.
+    """
+    reads_sep = _FACTORY.compile("$exists($sep)")
+    binds_sep = _FACTORY.compile("$sep & '!'")
+
+    threads = 4
+    iterations = 200
+    start = threading.Barrier(threads)
+    leaked: list[object] = []
+    lock = threading.Lock()
+
+    def worker(tid: int) -> None:
+        start.wait()
+        for _ in range(iterations):
+            if binds_sep.evaluate(None, JsonataBindings().bind_value("sep", f"s{tid}")) != f"s{tid}!":
+                with lock:
+                    leaked.append(("wrong value", tid))
+            saw = reads_sep.evaluate(None)  # no bindings at all
+            if saw is not False:
+                with lock:
+                    leaked.append(("leaked $sep", tid, saw))
+
+    workers = [threading.Thread(target=worker, args=(t,)) for t in range(threads)]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+
+    assert not leaked, leaked[:10]
+
+
+# =============================================================================
 # JsonataExpressionFactory -- concurrent compilation
 # =============================================================================
 

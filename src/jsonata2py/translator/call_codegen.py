@@ -120,7 +120,10 @@ def gen_user_function_call(t: Translator, n: FunctionCall, args: list[str], ctx:
         # fn_apply_tco enables TCO (trampoline) when in tail position.
         apply_fn = "fn_apply_tco" if ctx.is_tail_position else "fn_apply"
         if len(args) <= 1:
-            arg = "None" if not args else args[0]
+            # A parameter the call does not supply is *absent*, not null:
+            # `($f := function($a){$a}; $f())` is undefined in the reference,
+            # and `None` here is JSON null.
+            arg = "MISSING" if not args else args[0]
             return f"{apply_fn}({fn_ref}, {arg})"
         return f"{apply_fn}({fn_ref}, pack_args({', '.join(args)}))"
     return f"call_bound_function({py_string(n.name)}, {array_literal})"
