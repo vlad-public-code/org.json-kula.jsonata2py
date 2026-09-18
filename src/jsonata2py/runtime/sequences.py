@@ -15,7 +15,7 @@ from typing import Any
 
 from ..errors import _RuntimeEvaluationError as RuntimeEvaluationError
 from . import core as _core
-from .values import MISSING
+from .values import MISSING, PackedArgs
 
 
 def fn_sort(arg: Any, key_fn: Callable[[Any], Any] | None, descending: bool = False) -> Any:
@@ -133,7 +133,7 @@ def fn_sort_comparator(arg: Any, comparator_fn: Callable[[Any], Any]) -> Any:
         # is_truthy(compare([a, b])) else -1` -- makes `a < b` mean "not
         # (a after b)", i.e. a <= b, which is *true* for ties and swaps
         # every tied pair. Same call count, silently unstable.
-        return -1 if is_truthy(compare([b, a])) else 1
+        return -1 if is_truthy(compare(PackedArgs((b, a)))) else 1
 
     items.sort(key=functools.cmp_to_key(cmp))
     return items
@@ -299,7 +299,7 @@ def fn_reduce(arr: Any, fn: Callable[[Any], Any], init: Any) -> Any:
         acc = init
         start = 0
     for i in range(start, len(items)):
-        acc = fn([acc, items[i], i, items])
+        acc = fn(PackedArgs((acc, items[i], i, items)))
     return acc
 
 
@@ -312,7 +312,7 @@ def fn_map_indexed(arr: Any, fn: Callable[[Any], Any]) -> Any:
     items = list(arr) if isinstance(arr, list) else [arr]
     result: list[Any] = []
     for i, item in enumerate(items):
-        val = fn([item, i, arr])
+        val = fn(PackedArgs((item, i, arr)))
         if val is not MISSING:
             result.append(val)
     # A sequence, so a lone result collapses -- exactly as the one-parameter
@@ -394,7 +394,7 @@ def fn_sift(obj: Any, fn: Callable[[Any], Any]) -> Any:
         return MISSING
     result: dict[str, Any] = {}
     for k, v in obj.items():
-        if _core.is_truthy(fn([v, k, obj])):
+        if _core.is_truthy(fn(PackedArgs((v, k, obj)))):
             result[k] = v
     return result if result else MISSING
 
@@ -405,7 +405,7 @@ def fn_each(obj: Any, fn: Callable[[Any], Any]) -> Any:
         return MISSING
     result: list[Any] = []
     for k, v in obj.items():
-        r = fn([v, k, obj])
+        r = fn(PackedArgs((v, k, obj)))
         if r is not MISSING:
             result.append(r)
     return _core.unwrap(result)

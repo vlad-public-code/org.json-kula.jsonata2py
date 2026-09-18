@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..errors import _RuntimeEvaluationError as RuntimeEvaluationError
 from . import context as _ctx
-from .values import MISSING, UNKNOWN_ARITY, JLambda
+from .values import MISSING, UNKNOWN_ARITY, JLambda, PackedArgs
 
 if TYPE_CHECKING:
     from .signature import BoundFunction
@@ -198,7 +198,7 @@ def _invoke_bound(name: str, fn: BoundFunction, arity: int, arg: Any) -> Any:
     MISSING."""
     if arity == 0:
         args: list[Any] = []
-    elif arity >= 2 and isinstance(arg, list):
+    elif arity >= 2 and isinstance(arg, PackedArgs):
         args = [arg[i] if i < len(arg) else MISSING for i in range(arity)]
     else:
         args = [arg]

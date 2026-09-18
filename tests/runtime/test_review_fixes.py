@@ -257,3 +257,99 @@ class TestPy11GroupByScaling:
         # 4x the items. Linear gives ~4x the time (measured 3.8-5.7x);
         # the quadratic accumulation gave ~16x.
         assert large < small * 9, f"20k={small:.4f}s 80k={large:.4f}s"
+
+
+class TestPy5PackedArguments:
+    """PY-5: a lambda body unpacked its parameters whenever it was applied to
+    a `list`, so a multi-parameter lambda called with ONE array argument had
+    that array spread across its parameters."""
+
+    @pytest.mark.parametrize(
+        ("expr", "expected"),
+        [
+            ('( $f := function($arr, $sep){ $join($arr, $sep) }; $f(["a","b"]) )', "ab"),
+            ('( $f := function($a,$b){ $a }; $f([1,2]) )', [1, 2]),
+            ('( $f := function($a,$b,$c){ [$a,$b,$c] }; $f([1,2,3]) )', [1, 2, 3]),
+            # piping an array into a 2-parameter function is the same shape
+            ('( $f := function($arr,$sep){ $join($arr,$sep) }; ["a","b"] ~> $f() )', "ab"),
+            # genuine multi-argument calls still unpack
+            ('( $f := function($a,$b){ [$a,$b] }; $f([1,2],[3,4]) )', [1, 2, 3, 4]),
+            ('( $f := function($a,$b){ $b }; $f([1,2], 9) )', 9),
+            ('( $f := function($a,$b){ [$a,$b] }; $f(1) )', [1]),
+            ('( $f := function($a){ $a }; $f([1,2]) )', [1, 2]),
+            # built-in callbacks still receive [value, index, array]
+            ("$map([[1,2],[3,4]], function($v,$i){ [$v,$i] })", [[1, 2, 0], [3, 4, 1]]),
+            ('( $f := function($a,$b){ [$a,$b] }; $map([[1,2]], $f) )', [1, 2, 0]),
+            ('$sift({"a":1}, function($v,$k){ $k = "a" })', {"a": 1}),
+            ('$each({"a":1}, function($v,$k){ $k })', "a"),
+            ("$reduce([[1],[2]], function($a,$b){ $append($a,$b) })", [1, 2]),
+        ],
+    )
+    def test_argument_packing(self, expr: str, expected: object) -> None:
+        assert ev(expr) == expected
+
+    def test_pack_args_produces_the_marker_type(self) -> None:
+        from jsonata2py.runtime.core import pack_args
+        from jsonata2py.runtime.values import PackedArgs
+
+        assert isinstance(pack_args(1, 2), PackedArgs)
+        assert not isinstance([1, 2], PackedArgs)
+
+
+class TestPy6Eval:
+    """PY-6: `$eval` compiled the text into a fresh expression evaluated with
+    no bindings, its own recursion budget and no deadline. The reference
+    evaluates it in the environment of the `$eval` call."""
+
+    @pytest.mark.parametrize(
+        ("expr", "data", "expected"),
+        [
+            ('( $x := 5; $eval("$x + 1") )', None, 6),
+            ('( $x := 5; $eval("$x + 1", {"a":1}) )', None, 6),
+            # innermost binding wins
+            ('( $x := 5; ( $x := 9; $eval("$x") ) )', None, 9),
+            # a local *function* is callable from the nested expression
+            ('( $g := function($n){$n*3}; $eval("$g(2)") )', None, 6),
+            # a local bound inside a path block is visible too
+            ('a.( $x := b; $eval("$x") )', {"a": {"b": 7}}, 7),
+            # the nested frame's own locals do not escape
+            ('( $x := 1; $eval("($x := 2; $x)") + $x )', None, 3),
+            ('$eval("$sum([1,2])")', None, 3),
+            ('$eval("$foo")', None, MISSING),
+            ('$eval("$")', {"a": 1}, {"a": 1}),
+        ],
+    )
+    def test_scope(self, expr: str, data: object, expected: object) -> None:
+        assert ev(expr, data) == expected
+
+    def test_per_evaluation_value_bindings_are_visible(self) -> None:
+        b = jsonata.JsonataBindings().bind_value("y", 41)
+        expr = jsonata.JsonataExpressionFactory().compile('$eval("$y + 1")')
+        assert expr.evaluate(None, b) == 42
+
+    def test_per_evaluation_function_bindings_are_visible(self) -> None:
+        b = jsonata.JsonataBindings().bind_function("dbl", lambda a: a * 2)
+        expr = jsonata.JsonataExpressionFactory().compile('$eval("$dbl(4)")')
+        assert expr.evaluate(None, b) == 8
+
+    def test_nested_eval_cannot_escape_the_outer_timeout(self) -> None:
+        # The nested expression has no timeout of its own, so before the
+        # deadline was inherited this ran to completion in 637 ms despite a
+        # 20 ms budget. (The reference leaks its timeout here too; the three
+        # ports deliberately close the hole rather than reproduce it.)
+        import time
+
+        expr = jsonata.JsonataExpressionFactory().compile('$eval("$sum([1..3000000])")')
+        expr.set_timeout(20)
+        start = time.perf_counter()
+        with pytest.raises(JsonataEvaluationError):
+            expr.evaluate(None)
+        assert time.perf_counter() - start < 1.0
+
+    def test_nested_eval_shares_the_recursion_budget(self) -> None:
+        # Recursing through $eval used to get a fresh call-depth counter
+        # each time, so the U1001 limit never fired.
+        expr = ('( $f := function($n){ $n = 0 ? 0 '
+                ': $eval("$f(" & $string($n-1) & ")") }; $f(500) )')
+        with pytest.raises(JsonataEvaluationError):
+            ev(expr)

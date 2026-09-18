@@ -85,6 +85,12 @@ def _captured_outer_context(
         return [], [], []
     used: dict[str, None] = {}
     scope_analyzer.collect_free_vars_into(body, used, set(own_params))
+    if scope_analyzer.contains_eval_call(body):
+        # $eval's text is opaque to static analysis and the locals snapshot
+        # emitted at its call site names every visible local, so they all
+        # have to reach the generated def.
+        for name in outer_locals:
+            used.setdefault(name, None)
     captured_vars = [name for name in used if name in outer_locals]
 
     extra_param_decls: list[str] = []
@@ -400,12 +406,12 @@ def build_inline_lambda_with_sig(t: Translator, lam: Lambda, ctx: GenCtx) -> str
         if not lam.params:
             pass
         elif len(lam.params) == 1:
-            body_lines.append(f"{java_names[0]} = _pk[0] if isinstance(_pk, list) else _pk")
+            body_lines.append(f"{java_names[0]} = _pk[0] if isinstance(_pk, PackedArgs) else _pk")
         else:
-            body_lines.append(f"{java_names[0]} = _pk[0] if isinstance(_pk, list) else _pk")
+            body_lines.append(f"{java_names[0]} = _pk[0] if isinstance(_pk, PackedArgs) else _pk")
             for i in range(1, len(lam.params)):
                 body_lines.append(
-                    f"{java_names[i]} = _pk[{i}] if isinstance(_pk, list) and len(_pk) > {i} else MISSING"
+                    f"{java_names[i]} = _pk[{i}] if isinstance(_pk, PackedArgs) and len(_pk) > {i} else MISSING"
                 )
         for i, pt in enumerate(param_types):
             if i >= len(lam.params):
@@ -445,10 +451,10 @@ def gen_lambda_method(t: Translator, lam: Lambda, ctx: GenCtx, tail: bool = Fals
         body_ctx = ctx.with_ctx("_pk")
         if tail:
             body_ctx = body_ctx.with_tail_position(True)
-        body_lines.append(f"{pyvar(lam.params[0])} = _pk[0] if isinstance(_pk, list) else _pk")
+        body_lines.append(f"{pyvar(lam.params[0])} = _pk[0] if isinstance(_pk, PackedArgs) else _pk")
         for i in range(1, len(lam.params)):
             body_lines.append(
-                f"{pyvar(lam.params[i])} = _pk[{i}] if isinstance(_pk, list) and len(_pk) > {i} "
+                f"{pyvar(lam.params[i])} = _pk[{i}] if isinstance(_pk, PackedArgs) and len(_pk) > {i} "
                 f"and _pk[{i}] is not MISSING else MISSING"
             )
         body_expr = accept(body_for_capture, t, body_ctx)

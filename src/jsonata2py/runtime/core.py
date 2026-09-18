@@ -29,7 +29,7 @@ from typing import Any, cast
 from ..errors import _RuntimeEvaluationError as RuntimeEvaluationError
 from . import context as _ctx
 from .context import DEADLINE_STACK as _DEADLINE_STACK
-from .values import MISSING, JLambda, JRegex, Preserved, is_function, is_number, is_regex
+from .values import MISSING, JLambda, JRegex, PackedArgs, Preserved, is_function, is_number, is_regex
 
 __all__ = [
     "MISSING",
@@ -224,6 +224,7 @@ __all__ = [
     "object_of",
     "object_of_distinct",
     "or_",
+    "PackedArgs",
     "pack_args",
     "preserve_array",
     "range_",
@@ -1576,12 +1577,15 @@ def _is_truthy_uncommon(n: Any) -> bool:
 # =============================================================================
 
 
-def pack_args(*elements: Any) -> list[Any]:
+def pack_args(*elements: Any) -> PackedArgs:
     """Packs function arguments into a list WITHOUT flattening -- unlike
     array_of, which flattens list values. None (JSON null, D1) is a real
     argument value and is passed through as-is; only an actually-absent
-    slot should ever be MISSING, which callers pass explicitly."""
-    return list(elements)
+    slot should ever be MISSING, which callers pass explicitly.
+
+    The PackedArgs type is what tells a lambda body that it was given an
+    argument *list* rather than a single array argument."""
+    return PackedArgs(elements)
 
 
 def array(*elements: Any) -> list[Any]:
@@ -2007,8 +2011,8 @@ def fn_pad(str_: Any, width: Any, pad_char: Any = MISSING) -> Any:
     return _strings().fn_pad(str_, width, pad_char)
 
 
-def fn_eval(expr: Any, context: Any = MISSING) -> Any:
-    return _strings().fn_eval(expr, context)
+def fn_eval(expr: Any, context: Any = MISSING, locals_: dict[str, Any] | None = None) -> Any:
+    return _strings().fn_eval(expr, context, locals_)
 
 
 def fn_base64encode(str_: Any) -> Any:

@@ -589,7 +589,13 @@ def fn_pad(str_: Any, width: Any, pad_char: Any = MISSING) -> Any:
 # =============================================================================
 
 
-def fn_eval(expr: Any, context: Any = MISSING) -> Any:
+def fn_eval(expr: Any, context: Any = MISSING, locals_: dict[str, Any] | None = None) -> Any:
+    """`$eval(text[, focus])`.
+
+    locals_ is supplied by generated code: a snapshot of the block locals
+    lexically visible at this call site, which the reference sees because it
+    evaluates the parsed text in the environment of the $eval call.
+    """
     from .. import context as _ctx
 
     if expr is MISSING:
@@ -598,7 +604,7 @@ def fn_eval(expr: Any, context: Any = MISSING) -> Any:
     if delegate is None:
         raise RuntimeEvaluationError(None, "$eval: no eval delegate registered (create a JsonataExpressionFactory first)")
     ctx = MISSING if context is MISSING else context
-    return delegate(_core.to_text(expr), ctx)
+    return delegate(_core.to_text(expr), ctx, locals_)
 
 
 # =============================================================================

@@ -9,6 +9,8 @@ block, and whether a given variable name appears free inside a subtree.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from ..parser.ast_nodes import (
@@ -25,6 +27,7 @@ from ..parser.ast_nodes import (
     ForceArray,
     FunctionCall,
     GroupByExpr,
+    KeyValuePair,
     Lambda,
     LambdaCall,
     ObjectConstructor,
@@ -36,6 +39,7 @@ from ..parser.ast_nodes import (
     PredicateExpr,
     RangeExpr,
     SortExpr,
+    SortKey,
     TransformExpr,
     TransformLambda,
     UnaryMinus,
@@ -76,6 +80,43 @@ def compute_holder_needed(exprs: list[AstNode], block_local_names: set[str]) -> 
     return result
 
 
+def contains_eval_call(node: AstNode | None) -> bool:
+    """True when node contains a `$eval(...)` call.
+
+    $eval's expression text is a runtime string, so the free variables it
+    references are invisible to static analysis. A generated helper that
+    contains one therefore has to capture every visible local, because the
+    emitted locals snapshot names them all.
+    """
+    if node is None:
+        return False
+    if isinstance(node, FunctionCall) and node.name == "eval":
+        return True
+    return any(contains_eval_call(child) for child in _child_nodes(node))
+
+
+def _child_nodes(node: AstNode) -> Iterator[AstNode]:
+    """Every AST child of node, generically.
+
+    Walking the dataclass fields rather than enumerating node types keeps
+    this correct when a new node type is added -- a missed case here would
+    silently under-capture and produce a NameError in generated code.
+    """
+    for f in fields(node):  # type: ignore[arg-type]
+        value = getattr(node, f.name)
+        if isinstance(value, AstNode):
+            yield value
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, AstNode):
+                    yield item
+                elif isinstance(item, KeyValuePair):
+                    yield item.key
+                    yield item.value
+                elif isinstance(item, SortKey):
+                    yield item.key
+
+
 def collect_free_outer_vars(exprs: list[AstNode], block_locals: set[str], state: GenState) -> list[str]:
     """Returns the outer-scope local variable names that appear as free
     variables in exprs -- names in scope externally but not defined by the
@@ -92,10 +133,15 @@ def collect_free_outer_vars(exprs: list[AstNode], block_locals: set[str], state:
 
     used: dict[str, None] = {}
     bound: set[str] = set()
+    saw_eval = False
     for expr in exprs:
         collect_free_vars_into(expr, used, bound)
+        saw_eval = saw_eval or contains_eval_call(expr)
         if isinstance(expr, VariableBinding):
             bound.add(expr.name)
+    if saw_eval:
+        for name in outer_locals:
+            used.setdefault(name, None)
     return [name for name in used if name in outer_locals]
 
 

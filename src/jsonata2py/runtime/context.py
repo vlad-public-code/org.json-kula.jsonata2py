@@ -166,10 +166,10 @@ class EvalState:
         eval_delegate: Any,
     ) -> None:
         nested = self.active
+        outer_deadline = self.timeout_deadline if nested else None
         if nested:
             # Nested evaluation: suspend the enclosing one rather than
-            # overwriting it. The inner evaluation gets its own recursion
-            # budget, restored on the way out.
+            # overwriting it.
             self.suspended = _Frame(
                 self.bindings,  # type: ignore[arg-type]
                 self.millis,
@@ -179,7 +179,11 @@ class EvalState:
                 self.pending_tail_call,
                 self.suspended,
             )
-            self.call_depth = None
+            # call_depth is deliberately NOT reset: a nested $eval is part of
+            # the same evaluation and shares its U1001 recursion budget, so
+            # `$eval` cannot be used to reset the depth counter and recurse
+            # without bound. The trampoline slot IS fresh -- a tail call
+            # belongs to the evaluation that scheduled it.
             self.pending_tail_call = None
         self.active = True
         self.bindings = bindings
@@ -193,6 +197,12 @@ class EvalState:
         if not nested:
             self.millis = millis
         deadline = time.monotonic() + timeout_ms / 1000.0 if timeout_ms > 0 else None
+        # A nested evaluation inherits the enclosing deadline, and can only
+        # tighten it. The expression $eval compiles has no timeout of its
+        # own, so without this `$eval("<something slow>")` escaped the
+        # caller's timeout entirely.
+        if outer_deadline is not None:
+            deadline = outer_deadline if deadline is None else min(deadline, outer_deadline)
         self.timeout_deadline = deadline
         if deadline is not None:
             DEADLINE_STACK.append(deadline)
@@ -269,6 +279,24 @@ def begin_evaluation(
 def get_eval_delegate() -> Any:
     s = _current()
     return s.eval_delegate if s.active else None
+
+
+def bindings_for_nested_eval(extra_values: dict[str, Any] | None) -> Bindings:
+    """The bindings a nested `$eval` should see: everything the enclosing
+    evaluation has (permanent + per-evaluation), overlaid with the block
+    locals visible at the `$eval` call site.
+
+    The reference evaluates the parsed text in the *environment of the
+    $eval call*, so `( $x := 5; $eval("$x + 1") )` is 6; without this the
+    nested expression saw no bindings at all.
+    """
+    s = _current()
+    base = s.bindings if s.active and s.bindings is not None else _EMPTY_BINDINGS
+    if not extra_values:
+        return base
+    values = dict(base.get_values())
+    values.update(extra_values)
+    return _MergedBindings(values, dict(base.get_functions()))
 
 
 def empty_bindings() -> Bindings:

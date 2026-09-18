@@ -788,7 +788,13 @@ class Translator(Visitor[str, GenCtx]):
         if name == "pad":
             return f"fn_pad({a[0]}, {a[1]})" if len(a) == 2 else f"fn_pad({a[0]}, {a[1]}, {a[2]})"
         if name == "eval":
-            return f"fn_eval({a[0]}, {ctx.ctx_var})" if len(a) == 1 else f"fn_eval({a[0]}, {a[1]})"
+            # The locals snapshot is what makes `( $x := 5; $eval("$x+1") )`
+            # 6: the reference evaluates the parsed text in the environment
+            # of the $eval call, so every lexically visible local is in
+            # scope for it.
+            snap = _visible_locals_snapshot(ctx)
+            focus = ctx.ctx_var if len(a) == 1 else a[1]
+            return f"fn_eval({a[0]}, {focus}, {snap})"
         if name == "base64encode":
             return f"fn_base64encode({ctx_arg(a, ctx.ctx_var)})"
         if name == "base64decode":
@@ -1262,6 +1268,28 @@ class Translator(Visitor[str, GenCtx]):
             f"lambda_value(lambda {src_var}: fn_transform({src_var}, {loc_cb}, "
             f"{upd_cb}, {del_expr}), 1)"
         )
+
+
+def _visible_locals_snapshot(ctx: GenCtx) -> str:
+    """A dict literal mapping every lexically visible JSONata local name to
+    its current Python value, for `$eval` to evaluate its text against.
+
+    Innermost scope wins, which is what shadowing means:
+    `( $x := 5; ( $x := 9; $eval("$x") ) )` is 9.
+    """
+    refs: dict[str, str] = {}
+    for scope in reversed(ctx.state.scope_stack):
+        for jname in sorted(scope):
+            if jname in refs:
+                continue
+            if jname in ctx.state.holder_vars:
+                refs[jname] = f"{pyvar_ref(jname)}[0]"
+            else:
+                alias = ctx.state.get_alias(jname)
+                refs[jname] = alias if alias is not None else pyvar(jname)
+    if not refs:
+        return "None"
+    return "{" + ", ".join(f"{py_string(k)}: {v}" for k, v in refs.items()) + "}"
 
 
 # =============================================================================
