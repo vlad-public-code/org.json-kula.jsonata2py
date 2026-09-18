@@ -979,8 +979,9 @@ class Translator(Visitor[str, GenCtx]):
         result = src_expr
         for sk in reversed(n.keys):
             cb = self._sort_key_callback(sk.key, ctx)
-            sorted_call = f"fn_sort({result}, {cb})"
-            result = f"fn_reverse({sorted_call})" if sk.descending else sorted_call
+            # descending goes into fn_sort as an inverted comparator; reversing
+            # the ascending result would swap tied elements (PY-4).
+            result = f"fn_sort({result}, {cb}, {sk.descending})"
         # Two sources survive the sort without collapsing. A constructor's own
         # array is a `cons` value, and a cons value is not a sequence, so the
         # collapse does not apply: `a.[1]^(x)` is `[1]`, not `1`. A `[]`-wrapped
@@ -1036,8 +1037,7 @@ class Translator(Visitor[str, GenCtx]):
             result = src_expr
             for sk in reversed(n.keys):
                 cb = self._sort_key_callback(sk.key, ctx)
-                sorted_call = f"fn_sort({result}, {cb})"
-                result = f"fn_reverse({sorted_call})" if sk.descending else sorted_call
+                result = f"fn_sort({result}, {cb}, {sk.descending})"
             return f"unwrap({result})"
 
         if depth == 1:
@@ -1071,8 +1071,7 @@ class Translator(Visitor[str, GenCtx]):
             tuple_var = f"_tk{ctx.state.next_id()}"
             p_vars = [ref.replace("_TUPLE", tuple_var) for ref in parent_ref_exprs]
             key_expr = accept(sk.key, self, ctx.with_ctx(f"{tuple_var}[0]").with_parents(p_vars))
-            sorted_call = f"fn_sort({result}, lambda {tuple_var}: {key_expr})"
-            result = f"fn_reverse({sorted_call})" if sk.descending else sorted_call
+            result = f"fn_sort({result}, lambda {tuple_var}: {key_expr}, {sk.descending})"
         ext_var = f"_tex{ctx.state.next_id()}"
         return f"unwrap(fn_map({result}, lambda {ext_var}: {ext_var}[0]))"
 
@@ -1167,13 +1166,14 @@ class Translator(Visitor[str, GenCtx]):
             # itself an array: grouping `[[1,2],[3]]` under one key gives
             # `[1,2,3]`, and a lone `[3]` stays `[3]` because the first item
             # is stored verbatim.
-            body_lines.append(f"    if _kNode{pi} in {grp_var}:")
-            body_lines.append(
-                f"        {grp_var}[_kNode{pi}] = fn_append({grp_var}[_kNode{pi}], {elem_var})"
-            )
-            body_lines.append("    else:")
-            body_lines.append(f"        {grp_var}[_kNode{pi}] = {elem_var}")
-            body_lines.append(f"for _k{pi}, {elem_var} in {grp_var}.items():")
+            #
+            # The bucket is filled with plain appends and folded once at the
+            # end (fn_append_all). Calling fn_append per element copied the
+            # whole accumulated list each time, making a single large bucket
+            # quadratic in both time and allocation.
+            body_lines.append(f"    {grp_var}.setdefault(_kNode{pi}, []).append({elem_var})")
+            body_lines.append(f"for _k{pi}, _bucket{pi} in {grp_var}.items():")
+            body_lines.append(f"    {elem_var} = fn_append_all(_bucket{pi})")
             if ctx.primary_context_var is not None:
                 body_lines.append(f"    {ctx.primary_context_var} = {elem_var}")
             body_lines.append(f"    _v{pi} = {v_expr}")

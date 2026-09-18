@@ -18,7 +18,15 @@ from . import core as _core
 from .values import MISSING
 
 
-def fn_sort(arg: Any, key_fn: Callable[[Any], Any] | None) -> Any:
+def fn_sort(arg: Any, key_fn: Callable[[Any], Any] | None, descending: bool = False) -> Any:
+    """`^(key)` / `$sort`. `descending` inverts the comparator -- it does NOT
+    reverse the ascending result.
+
+    The reference merge-sorts with a comparator that negates `comp` only
+    after the undefined checks have already `continue`d, so a missing key
+    sorts last in BOTH directions, and equal keys keep their input order.
+    Reversing an ascending sort gets both of those backwards: `items^(>a)`
+    over two items tied on `a` used to come out swapped."""
     key_fn = _core.deadline_guard(key_fn) if key_fn is not None else None
     if arg is MISSING:
         return MISSING
@@ -80,18 +88,25 @@ def fn_sort(arg: Any, key_fn: Callable[[Any], Any] | None) -> Any:
     # Keys are already extracted and validated to be all-number or
     # all-string; a native key-sort is a direct translation of cmp's rules
     # (MISSING/None sorts last) with no per-comparison Python call.
+    #
+    # A missing key must land last either way, so its rank is the one that
+    # ends up last under this direction: 1 ascending, 0 under reverse=True.
+    missing_rank = 0 if descending else 1
+    present_rank = 1 - missing_rank
     if has_number:
 
         def sort_key(i: int, _keys: list[Any] = keys) -> tuple[int, Any]:
             v = _keys[i]
-            return (1, 0.0) if (v is MISSING or v is None) else (0, float(v))
+            return (missing_rank, 0.0) if (v is MISSING or v is None) else (present_rank, float(v))
     else:
 
         def sort_key(i: int, _keys: list[Any] = keys) -> tuple[int, Any]:
             v = _keys[i]
-            return (1, "") if (v is MISSING or v is None) else (0, v)
+            return (missing_rank, "") if (v is MISSING or v is None) else (present_rank, v)
 
-    indices = sorted(range(len(items)), key=sort_key)
+    # sorted(reverse=True) is stable in CPython -- it does not reverse ties --
+    # so equal keys keep their input order, as the reference's merge sort does.
+    indices = sorted(range(len(items)), key=sort_key, reverse=descending)
     return [items[i] for i in indices]
 
 

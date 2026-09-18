@@ -86,6 +86,7 @@ __all__ = [
     "filter_field_eq",
     "fn_abs",
     "fn_append",
+    "fn_append_all",
     "fn_apply",
     "fn_apply_tco",
     "fn_arg_count_error",
@@ -2464,6 +2465,32 @@ def fn_append(a: Any, b: Any) -> Any:
     return result
 
 
+def fn_append_all(items: list[Any]) -> Any:
+    """The left fold of fn_append over `items`, in one pass.
+
+    Group-by used to accumulate a bucket with `grp[k] = fn_append(grp[k], e)`,
+    and fn_append copies the whole accumulated list every time -- O(n^2) in
+    the bucket size (20 000 items in one bucket took 424 ms). The fold is
+    reproduced exactly, including its two asymmetries: a MISSING operand is
+    skipped rather than flattened, and a single surviving item is returned
+    verbatim (so a lone `[3]` stays `[3]` while `[[1,2],[3]]` collapses to
+    `[1,2,3]`).
+    """
+    acc: Any = MISSING
+    out: list[Any] | None = None
+    for item in items:
+        if item is MISSING:
+            continue
+        if out is None:
+            if acc is MISSING:
+                acc = item
+                continue
+            out = []
+            _append_to_sequence(out, acc)
+        _append_to_sequence(out, item)
+    return acc if out is None else out
+
+
 def fn_reverse(arg: Any) -> Any:
     if arg is MISSING:
         return MISSING
@@ -2803,18 +2830,23 @@ def fn_each(obj: Any, fn: Any) -> Any:
     return _seq.fn_each(obj, tuple_callback(fn))
 
 
-def fn_sort(arr: Any, fn: Any = MISSING) -> Any:
+def fn_sort(arr: Any, fn: Any = MISSING, descending: bool = False) -> Any:
+    """`$sort(arr[, comparator])` and the generated form of `^(key)`.
+
+    `descending` is only ever set by the order-by codegen; the $sort built-in
+    has no such parameter and always sorts ascending.
+    """
     _seq = _sequences()
     require_function(fn, 2, optional=True)
     lambda_arity = _lambdas().lambda_arity
 
     if fn is MISSING:
-        return _seq.fn_sort(arr, None)
+        return _seq.fn_sort(arr, None, descending)
     if not isinstance(fn, JLambda):
-        return _seq.fn_sort(arr, fn)
+        return _seq.fn_sort(arr, fn, descending)
     if lambda_arity(fn) >= 2:
         return _seq.fn_sort_comparator(arr, tuple_callback(fn))
-    return _seq.fn_sort(arr, element_callback(fn))
+    return _seq.fn_sort(arr, element_callback(fn), descending)
 
 
 def fn_sort_comparator(arr: Any, comparator_fn: Callable[[Any], Any]) -> Any:

@@ -139,3 +139,121 @@ class TestPy12NonFiniteFold:
 
     def test_modulo_still_folded(self) -> None:
         assert ev("10 % 3") == 1
+
+
+class TestPy4DescendingSort:
+    """PY-4: `^(>key)` was compiled as fn_reverse(fn_sort(...)). Reversing a
+    stable ascending sort swaps tied elements and moves missing keys to the
+    front; the reference negates the comparator *after* its undefined checks
+    have already short-circuited, so ties keep input order and a missing key
+    sorts last in both directions."""
+
+    @pytest.mark.parametrize(
+        ("expr", "data", "expected"),
+        [
+            # tied keys keep input order
+            ("items^(>a).n",
+             {"items": [{"a": 1, "n": "x"}, {"a": 1, "n": "y"}]},
+             ["x", "y"]),
+            ("items^(>a).n",
+             {"items": [{"a": "b", "n": "x"}, {"a": "a", "n": "y"}, {"a": "b", "n": "z"}]},
+             ["x", "z", "y"]),
+            # secondary key is applied within the descending primary groups
+            ("items^(>a, b).b",
+             {"items": [{"a": 1, "b": 1}, {"a": 1, "b": 2}, {"a": 2, "b": 5}]},
+             [5, 1, 2]),
+            ("items^(<a, >b).n",
+             {"items": [{"a": 1, "b": 1, "n": "p"}, {"a": 1, "b": 2, "n": "q"},
+                        {"a": 1, "b": 2, "n": "r"}]},
+             ["q", "r", "p"]),
+            # a missing key sorts last descending, exactly as ascending
+            ("items^(>a).n",
+             {"items": [{"a": 1, "n": "x"}, {"n": "m"}, {"a": 2, "n": "z"}, {"n": "m2"}]},
+             ["z", "x", "m", "m2"]),
+            ("items^(a).n",
+             {"items": [{"a": 1, "n": "x"}, {"n": "m"}, {"a": 2, "n": "z"}, {"n": "m2"}]},
+             ["x", "z", "m", "m2"]),
+            ("items^(>$.a)", {"items": [{"a": 2}, {"a": 1}]}, [{"a": 2}, {"a": 1}]),
+        ],
+    )
+    def test_order(self, expr: str, data: object, expected: object) -> None:
+        assert ev(expr, data) == expected
+
+    def test_descending_over_a_tuple_stream(self) -> None:
+        # sort_tuples took the same reversed-ascending shortcut.
+        data = {"items": [{"a": 1, "n": "x"}, {"a": 1, "n": "y"}]}
+        assert ev("items@$e^(>$e.a).($e.n)", data) == ["x", "y"]
+
+    def test_sort_builtin_is_unaffected(self) -> None:
+        assert ev("$sort([3,1,2])") == [1, 2, 3]
+
+
+class TestPy10PadAllocation:
+    """PY-10 / M-1: the pad width comes straight from input data, and $pad
+    built a string of that length -- `$pad("a", 1e15)` grew the process to
+    10.7 GB. The reference throws a host RangeError ("Invalid array length"),
+    which is not a JSONata error at all, so a JSONata error is raised here."""
+
+    @pytest.mark.parametrize("width", [1e15, -1e15, 2**40])
+    def test_huge_width_raises_instead_of_allocating(self, width: float) -> None:
+        assert code(f"$pad('a', {width!r})") == "D1001"
+
+    @pytest.mark.parametrize(
+        ("expr", "expected"),
+        [
+            ("$pad('a', 5)", "a    "),
+            ("$pad('a', -5, 'xy')", "xyxya"),
+            ("$pad('foo', 8, '-+')", "foo-+-+-"),
+            ("$pad('a', 0)", "a"),
+            ("$pad('abc', 2)", "abc"),
+            ("$pad('', 3, 'ab')", "aba"),
+        ],
+    )
+    def test_normal_widths_unchanged(self, expr: str, expected: str) -> None:
+        assert ev(expr) == expected
+
+
+class TestPy11GroupByScaling:
+    """PY-11 / M-2: a group-by bucket was accumulated with
+    `grp[k] = fn_append(grp[k], elem)`, and fn_append copies the whole
+    accumulated list -- O(n^2) time and allocation in the bucket size."""
+
+    @pytest.mark.parametrize(
+        ("expr", "data", "expected"),
+        [
+            # fn_append's flatten-one-level rule must survive the rewrite
+            ("a{b: c}", {"a": [{"b": "x", "c": [1, 2]}, {"b": "x", "c": [3]}]},
+             {"x": [1, 2, 3]}),
+            # ...including "a lone item is stored verbatim"
+            ("a{b: c}", {"a": [{"b": "x", "c": [3]}]}, {"x": [3]}),
+            ("a{b: c}", {"a": [{"b": "x", "c": 1}, {"b": "x", "c": 2},
+                               {"b": "y", "c": 3}]}, {"x": [1, 2], "y": 3}),
+            ("a{b: $sum(c)}", {"a": [{"b": "x", "c": 1}, {"b": "x", "c": 2},
+                                     {"b": "y", "c": 3}]}, {"x": 3, "y": 3}),
+            ("nope{'k':1}", None, {"k": 1}),
+            ("nope{'k':$string($)}", None, {}),
+        ],
+    )
+    def test_semantics_unchanged(self, expr: str, data: object, expected: object) -> None:
+        assert ev(expr, data) == expected
+
+    def test_one_large_bucket_scales_linearly(self) -> None:
+        import time
+
+        expr = jsonata.JsonataExpressionFactory().compile("a{b: c}")
+
+        def timed(n: int) -> float:
+            data = {"a": [{"b": "x", "c": i} for i in range(n)]}
+            expr.evaluate(data)  # warm up
+            runs = []
+            for _ in range(5):
+                start = time.perf_counter()
+                expr.evaluate(data)
+                runs.append(time.perf_counter() - start)
+            return min(runs)
+
+        small = timed(20_000)
+        large = timed(80_000)
+        # 4x the items. Linear gives ~4x the time (measured 3.8-5.7x);
+        # the quadratic accumulation gave ~16x.
+        assert large < small * 9, f"20k={small:.4f}s 80k={large:.4f}s"

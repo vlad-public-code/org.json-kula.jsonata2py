@@ -806,8 +806,9 @@ def _compile_context_binding_step(
                 ctx.state.add_local_var_with_alias(cb.var_name, key_var)
                 key_expr = accept(sk.key, t, ctx.with_ctx(key_var))
                 ctx.state.pop_scope()
-                sorted_call = f"fn_sort({sorted_expr}, lambda {key_var}: {key_expr})"
-                sorted_expr = f"fn_reverse({sorted_call})" if sk.descending else sorted_call
+                sorted_expr = (
+                    f"fn_sort({sorted_expr}, lambda {key_var}: {key_expr}, {sk.descending})"
+                )
 
             if from_ + 2 < n and isinstance(steps[from_ + 2], FieldRef):
                 cjp2 = ctx.ctx_var if not ctx.parent_vars else ctx.parent_vars[-1]
@@ -911,8 +912,7 @@ def _compile_position_binding_step(
             for sk in reversed(se.keys):
                 tk_var = f"_tk{ctx.state.next_id()}"
                 key_expr = accept(sk.key, t, ctx.with_ctx(f"{tk_var}[0]"))
-                sorted_call = f"fn_sort({result}, lambda {tk_var}: {key_expr})"
-                result = f"fn_reverse({sorted_call})" if sk.descending else sorted_call
+                result = f"fn_sort({result}, lambda {tk_var}: {key_expr}, {sk.descending})"
             return _compile_path_steps(t, steps, from_ + 2, result, ctx.with_tuple_pos(pb.var_name))
 
         # When #$pos follows a PredicateExpr inside outer loops
