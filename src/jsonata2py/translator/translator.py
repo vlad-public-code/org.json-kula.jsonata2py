@@ -1203,18 +1203,28 @@ class Translator(Visitor[str, GenCtx]):
     def visit_chain_expr(self, n: ChainExpr, ctx: GenCtx) -> str:
         expr = accept(n.steps[0], self, ctx)
         for step in n.steps[1:]:
-            fn_expr = self._chain_step_to_lambda(step, ctx)
-            expr = f"fn_pipe({expr}, {fn_expr})"
+            fn_expr, is_invocation = self._chain_step_to_lambda(step, ctx)
+            if is_invocation:
+                # A step WRITTEN as a call is an invocation, never a
+                # composition: `$f ~> $type()` asks for the type of $f, which
+                # is "function". fn_pipe composes whenever its left operand is
+                # a function value, so routing a call step through it returned
+                # a composed lambda instead of the answer. Composition stays
+                # for value steps -- `$trim ~> $uppercase`, no parentheses.
+                expr = f"fn_apply({fn_expr}, {expr})"
+            else:
+                expr = f"fn_pipe({expr}, {fn_expr})"
         return expr
 
-    def _chain_step_to_lambda(self, step: AstNode, ctx: GenCtx) -> str:
+    def _chain_step_to_lambda(self, step: AstNode, ctx: GenCtx) -> tuple[str, bool]:
+        """(callable expression, True when the step was written as a call)."""
         if isinstance(step, FunctionCall):
             args_with_pipe: list[AstNode] = [PartialPlaceholder(), *step.args]
-            return self.visit_partial_application(PartialApplication(step.name, args_with_pipe), ctx)
+            return self.visit_partial_application(PartialApplication(step.name, args_with_pipe), ctx), True
         staged = self._chain_step_stages(step, ctx)
         if staged is not None:
-            return staged
-        return accept(step, self, ctx)
+            return staged, True
+        return accept(step, self, ctx), False
 
     #: Postfix forms the reference records as `stages` on an apply node.
     _CHAIN_STAGES = (ForceArray, PredicateExpr, ArraySubscript, SortExpr)
@@ -1254,8 +1264,17 @@ class Translator(Visitor[str, GenCtx]):
         update = n.update
         loc_cb = emit_callback(pattern, ctx, "_tl", lambda v: accept(pattern, self, ctx.with_ctx(v)))
         upd_cb = emit_callback(update, ctx, "_tu", lambda v: accept(update, self, ctx.with_ctx(v)))
-        del_expr = accept(n.delete, self, ctx) if n.delete is not None else "MISSING"
-        return f"fn_transform({src_expr}, {loc_cb}, {upd_cb}, {del_expr})"
+        # The delete clause is evaluated against EACH matched item, like the
+        # update clause -- `$ ~> |a|{}, del|` deletes the key each item's own
+        # `del` field names. Evaluating it once in the outer context made it
+        # a lookup of a top-level `del` field, which is normally missing.
+        del_cb = self._transform_delete_callback(n.delete, ctx)
+        return f"fn_transform({src_expr}, {loc_cb}, {upd_cb}, {del_cb})"
+
+    def _transform_delete_callback(self, delete: AstNode | None, ctx: GenCtx) -> str:
+        if delete is None:
+            return "None"
+        return emit_callback(delete, ctx, "_td", lambda v: accept(delete, self, ctx.with_ctx(v)))
 
     def visit_transform_lambda(self, n: TransformLambda, ctx: GenCtx) -> str:
         src_var = f"_ts{ctx.state.next_id()}"
@@ -1263,10 +1282,10 @@ class Translator(Visitor[str, GenCtx]):
         update = n.update
         loc_cb = emit_callback(pattern, ctx, "_tl", lambda v: accept(pattern, self, ctx.with_ctx(v)))
         upd_cb = emit_callback(update, ctx, "_tu", lambda v: accept(update, self, ctx.with_ctx(v)))
-        del_expr = accept(n.delete, self, ctx) if n.delete is not None else "MISSING"
+        del_cb = self._transform_delete_callback(n.delete, ctx)
         return (
             f"lambda_value(lambda {src_var}: fn_transform({src_var}, {loc_cb}, "
-            f"{upd_cb}, {del_expr}), 1)"
+            f"{upd_cb}, {del_cb}), 1)"
         )
 
 

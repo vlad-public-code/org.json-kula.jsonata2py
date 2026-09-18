@@ -113,7 +113,9 @@ def test_transform_pattern_and_update_callbacks_both_hoist() -> None:
         "_fn0 = lambda _p0: _p0",
         "_fn1 = lambda _p0: object_of_distinct(_keys0, [99])",
     ]
-    assert "fn_transform(_ts0, _fn0, _fn1, MISSING)" in src
+    # The delete clause is now a per-item callback too, so an absent one
+    # is None rather than a MISSING value evaluated in the outer context.
+    assert "fn_transform(_ts0, _fn0, _fn1, None)" in src
 
 
 def test_hoisted_callbacks_use_canonical_parameter_names() -> None:

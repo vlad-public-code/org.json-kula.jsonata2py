@@ -3015,8 +3015,22 @@ def fn_values(obj: Any) -> Any:
     return values if values else MISSING
 
 
-def fn_transform(source: Any, location_fn: Callable[[Any], Any], update_fn: Callable[[Any], Any], delete_fields: Any) -> Any:
-    """Implements the transform operator src ~> |location|update[,delete]|."""
+_T2012_MESSAGE = (
+    "The delete clause of the transform expression must evaluate to a string or array of strings"
+)
+
+
+def fn_transform(
+    source: Any,
+    location_fn: Callable[[Any], Any],
+    update_fn: Callable[[Any], Any],
+    delete_fn: Callable[[Any], Any] | None = None,
+) -> Any:
+    """Implements the transform operator src ~> |location|update[,delete]|.
+
+    delete_fn is evaluated per matched item, in that item's context, exactly
+    like update_fn -- the reference evaluates both against each match.
+    """
     if source is MISSING:
         return MISSING
     copy = _deep_copy(source)
@@ -3034,18 +3048,23 @@ def fn_transform(source: Any, location_fn: Callable[[Any], Any], update_fn: Call
                         "The update clause of the transform operator requires an object literal as the second operand",
                     )
                 target.update(update)
-            if delete_fields is not MISSING:
-                if not isinstance(delete_fields, str) and not isinstance(delete_fields, list):
-                    raise RuntimeEvaluationError(
-                        "T2012",
-                        "The delete clause of the transform operator is not valid, must be a string or array of strings",
-                    )
-                if isinstance(delete_fields, str):
-                    target.pop(delete_fields, None)
-                else:
-                    for f in delete_fields:
-                        if isinstance(f, str):
-                            target.pop(f, None)
+            if delete_fn is None:
+                continue
+            delete_fields = delete_fn(target)
+            if delete_fields is MISSING:
+                continue
+            if isinstance(delete_fields, str):
+                names: list[Any] = [delete_fields]
+            elif isinstance(delete_fields, list):
+                names = delete_fields
+            else:
+                raise RuntimeEvaluationError("T2012", _T2012_MESSAGE)
+            for f in names:
+                # A non-string element is an error, not something to skip:
+                # the reference reports T2012 for `|a|{}, [1]|`.
+                if not isinstance(f, str):
+                    raise RuntimeEvaluationError("T2012", _T2012_MESSAGE)
+                target.pop(f, None)
     return copy
 
 

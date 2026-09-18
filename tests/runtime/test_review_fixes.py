@@ -353,3 +353,55 @@ class TestPy6Eval:
                 ': $eval("$f(" & $string($n-1) & ")") }; $f(500) )')
         with pytest.raises(JsonataEvaluationError):
             ev(expr)
+
+
+class TestPy7ArrayConstructorStage:
+    """PY-7: a `[...]` stage after an array-constructor step was applied to
+    the collected path result instead of to each element's own array."""
+
+    def test_filter_applies_to_each_constructed_array(self) -> None:
+        # Reference: [2,2]. Filtering the collected result compared the two
+        # arrays against a number instead and raised T2010.
+        assert ev("objs.[1,2][$>1]", {"objs": [{}, {}]}) == [2, 2]
+
+    def test_numeric_subscript_still_indexes_each_element(self) -> None:
+        assert ev("objs.[1,2][0]", {"objs": [{}, {}]}) == [1, 1]
+
+
+class TestPy8ChainCallInvokes:
+    """PY-8: a chain step written as a call is an invocation, never a
+    composition -- `$f ~> $type()` asks for the type of `$f`."""
+
+    def test_call_step_invokes_on_a_function_value(self) -> None:
+        assert ev("$trim ~> $type()") == "function"
+
+    def test_call_step_invokes_string_on_a_function_value(self) -> None:
+        assert ev("$trim ~> $string()") == ""
+
+    def test_value_step_without_parentheses_still_composes(self) -> None:
+        # No parentheses, so this is composition, and the composed function
+        # must still be callable.
+        assert ev("( $f := $trim ~> $uppercase; $f('  hi  ') )") == "HI"
+
+    def test_ordinary_chain_is_unaffected(self) -> None:
+        assert ev("'  hi  ' ~> $trim() ~> $uppercase()") == "HI"
+
+
+class TestPy9TransformDeletePerItem:
+    """PY-9: the delete clause was evaluated once in the outer context, so it
+    read a top-level field instead of each matched item's own."""
+
+    def test_delete_clause_is_evaluated_against_each_match(self) -> None:
+        # `del` names the key to drop and lives on the matched item itself.
+        assert ev('$ ~> |a|{"x":1}, del|', {"a": {"del": "y", "y": 9, "z": 1}}) == {
+            "a": {"del": "y", "z": 1, "x": 1}
+        }
+
+    def test_array_of_names_deletes_each(self) -> None:
+        assert ev('$ ~> |a|{}, ["y","z"]|', {"a": {"y": 1, "z": 2, "w": 3}}) == {"a": {"w": 3}}
+
+    def test_missing_delete_result_is_a_no_op(self) -> None:
+        assert ev('$ ~> |a|{}, "nope"|', {"a": {"y": 1}}) == {"a": {"y": 1}}
+
+    def test_non_string_delete_element_raises_t2012(self) -> None:
+        assert code('$ ~> |a|{}, [1]|', {"a": {"y": 1}}) == "T2012"
