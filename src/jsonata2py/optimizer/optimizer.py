@@ -157,7 +157,7 @@ class _RewriteVisitor(Visitor[AstNode, None]):
         # -(-x) -> x
         if isinstance(operand, UnaryMinus):
             return operand.operand
-        return node if operand is node.operand else UnaryMinus(operand)
+        return node if operand is node.operand else replace(node, operand=operand)
 
     # ---- Binary operations ----
 
@@ -169,7 +169,7 @@ class _RewriteVisitor(Visitor[AstNode, None]):
         if folded is not None:
             return folded
 
-        return node if left is node.left and right is node.right else BinaryOp(node.op, left, right)
+        return node if left is node.left and right is node.right else replace(node, left=left, right=right)
 
     # ---- Conditional ----
 
@@ -181,16 +181,20 @@ class _RewriteVisitor(Visitor[AstNode, None]):
         # true ? a : b -> a
         if isinstance(condition, BooleanLiteral) and condition.value:
             return then
-        # false ? a : b -> b   (or null if no else-branch)
-        if isinstance(condition, BooleanLiteral) and not condition.value:
-            return otherwise if otherwise is not None else NullLiteral()
-        # null ? a : b -> b
-        if isinstance(condition, NullLiteral):
-            return otherwise if otherwise is not None else NullLiteral()
+        # false ? a : b -> b, null ? a : b -> b.
+        #
+        # Only folded when there IS an else-branch. With no else-branch the
+        # reference yields *undefined* (nothing), not JSON null, so folding to
+        # NullLiteral() here would turn `false ? 1` into `null` and
+        # `[false ? 1]` into `[null]` instead of `[]`. Leaving the node alone
+        # lets the runtime produce the correct missing value.
+        if isinstance(condition, BooleanLiteral | NullLiteral) and otherwise is not None:
+            if isinstance(condition, NullLiteral) or not condition.value:
+                return otherwise
 
         if condition is node.condition and then is node.then and otherwise is node.otherwise:
             return node
-        return ConditionalExpr(condition, then, otherwise)
+        return replace(node, condition=condition, then=then, otherwise=otherwise)
 
     # ---- Block ----
 
@@ -209,7 +213,7 @@ class _RewriteVisitor(Visitor[AstNode, None]):
             )
             if not is_self_ref:
                 return only
-        return node if exprs == node.expressions else Block(exprs)
+        return node if exprs == node.expressions else replace(node, expressions=exprs)
 
     # ---- Path expression ----
 
@@ -247,19 +251,19 @@ class _RewriteVisitor(Visitor[AstNode, None]):
             else:
                 flat.append(rewritten)
             prev_was_context_binding = isinstance(rewritten, ContextBinding)
-        return node if flat == node.steps else PathExpr(flat)
+        return node if flat == node.steps else replace(node, steps=flat)
 
     # ---- Predicate / subscript ----
 
     def visit_predicate_expr(self, node: PredicateExpr, ctx: None) -> AstNode:
         source = self.rewrite(node.source)
         predicate = self.rewrite(node.predicate)
-        return node if source is node.source and predicate is node.predicate else PredicateExpr(source, predicate)
+        return node if source is node.source and predicate is node.predicate else replace(node, source=source, predicate=predicate)
 
     def visit_array_subscript(self, node: ArraySubscript, ctx: None) -> AstNode:
         source = self.rewrite(node.source)
         index = self.rewrite(node.index)
-        return node if source is node.source and index is node.index else ArraySubscript(source, index)
+        return node if source is node.source and index is node.index else replace(node, source=source, index=index)
 
     # ---- Constructors ----
 
@@ -271,33 +275,38 @@ class _RewriteVisitor(Visitor[AstNode, None]):
 
     def visit_object_constructor(self, node: ObjectConstructor, ctx: None) -> AstNode:
         pairs = self._rewrite_pairs(node.pairs)
-        return node if pairs == node.pairs else ObjectConstructor(pairs)
+        return node if pairs == node.pairs else replace(node, pairs=pairs)
 
     # ---- Functions / lambdas / binding ----
 
     def visit_function_call(self, node: FunctionCall, ctx: None) -> AstNode:
         args = self._rewrite_list(node.args)
-        return node if args == node.args else FunctionCall(node.name, args)
+        # replace(), not FunctionCall(node.name, args): rebuilding would reset
+        # is_variable to its default, turning `$o.g(...)` into a lookup of a
+        # built-in named 'g'.
+        return node if args == node.args else replace(node, args=args)
 
     def visit_lambda(self, node: Lambda, ctx: None) -> AstNode:
         body = self.rewrite(node.body)
-        return node if body is node.body else Lambda(node.params, body)
+        # replace(), not Lambda(node.params, body): rebuilding would drop the
+        # declared signature, disabling argument type checking.
+        return node if body is node.body else replace(node, body=body)
 
     def visit_variable_binding(self, node: VariableBinding, ctx: None) -> AstNode:
         value = self.rewrite(node.value)
-        return node if value is node.value else VariableBinding(node.name, value)
+        return node if value is node.value else replace(node, value=value)
 
     # ---- Range, sort, group-by, chain, transform ----
 
     def visit_range_expr(self, node: RangeExpr, ctx: None) -> AstNode:
         from_ = self.rewrite(node.from_)
         to = self.rewrite(node.to)
-        return node if from_ is node.from_ and to is node.to else RangeExpr(from_, to)
+        return node if from_ is node.from_ and to is node.to else replace(node, from_=from_, to=to)
 
     def visit_sort_expr(self, node: SortExpr, ctx: None) -> AstNode:
         source = self.rewrite(node.source)
         keys = [SortKey(self.rewrite(k.key), k.descending) for k in node.keys]
-        return node if source is node.source and keys == node.keys else SortExpr(source, keys)
+        return node if source is node.source and keys == node.keys else replace(node, source=source, keys=keys)
 
     def visit_group_by_expr(self, node: GroupByExpr, ctx: None) -> AstNode:
         source = self.rewrite(node.source)
@@ -311,11 +320,11 @@ class _RewriteVisitor(Visitor[AstNode, None]):
             _unfold_to_path_steps(source, steps)
             steps.append(GroupByExpr(ContextRef(), pairs))
             return PathExpr(steps)
-        return node if source is node.source and pairs == node.pairs else GroupByExpr(source, pairs)
+        return node if source is node.source and pairs == node.pairs else replace(node, source=source, pairs=pairs)
 
     def visit_chain_expr(self, node: ChainExpr, ctx: None) -> AstNode:
         steps = self._rewrite_list(node.steps)
-        return node if steps == node.steps else ChainExpr(steps)
+        return node if steps == node.steps else replace(node, steps=steps)
 
     def visit_parenthesized(self, node: Parenthesized, ctx: None) -> AstNode:
         # The Parenthesized wrapper only exists to suppress path-step
@@ -373,16 +382,16 @@ class _RewriteVisitor(Visitor[AstNode, None]):
     def visit_elvis_expr(self, node: ElvisExpr, ctx: None) -> AstNode:
         left = self.rewrite(node.left)
         right = self.rewrite(node.right)
-        return node if left is node.left and right is node.right else ElvisExpr(left, right)
+        return node if left is node.left and right is node.right else replace(node, left=left, right=right)
 
     def visit_coalesce_expr(self, node: CoalesceExpr, ctx: None) -> AstNode:
         left = self.rewrite(node.left)
         right = self.rewrite(node.right)
-        return node if left is node.left and right is node.right else CoalesceExpr(left, right)
+        return node if left is node.left and right is node.right else replace(node, left=left, right=right)
 
     def visit_partial_application(self, node: PartialApplication, ctx: None) -> AstNode:
         args = self._rewrite_list(node.args)
-        return node if args == node.args else PartialApplication(node.name, args)
+        return node if args == node.args else replace(node, args=args)
 
     def visit_lambda_call(self, node: LambdaCall, ctx: None) -> AstNode:
         lambda_node = self.rewrite(node.lambda_)
@@ -390,7 +399,7 @@ class _RewriteVisitor(Visitor[AstNode, None]):
         if lambda_node is node.lambda_ and args == node.args:
             return node
         assert isinstance(lambda_node, Lambda)
-        return LambdaCall(lambda_node, args)
+        return replace(node, lambda_=lambda_node, args=args)
 
     # =====================================================================
     # Helpers
@@ -440,7 +449,7 @@ def _rewrite_paren_head(node: AstNode, rewrite: Callable[[AstNode], AstNode]) ->
     """Rewrites inside a parenthesised head without stripping its wrapper."""
     if isinstance(node, Parenthesized):
         inner = rewrite(node.inner)
-        return node if inner is node.inner else Parenthesized(inner)
+        return node if inner is node.inner else replace(node, inner=inner)
     if isinstance(node, ForceArray):
         src = _rewrite_paren_head(node.source, rewrite)
         return node if src is node.source else ForceArray(src, node.on_sequence)
@@ -509,10 +518,15 @@ def _fold_num_num(op: str, left: float, right: float) -> AstNode | None:
         if not math.isfinite(result):
             return None
         return NumberLiteral(result)
-    if op == "/":
-        return NumberLiteral(left / right) if right != 0 else None
-    if op == "%":
-        return NumberLiteral(_java_fmod(left, right)) if right != 0 else None
+    if op in ("/", "%"):
+        if right == 0:
+            return None
+        result = left / right if op == "/" else _java_fmod(left, right)
+        # Same non-finite guard as + - *: 1e308 / 1e-308 overflows to inf, and
+        # a NumberLiteral(inf) is not emittable as Python source.
+        if not math.isfinite(result):
+            return None
+        return NumberLiteral(result)
     if op == "=":
         return BooleanLiteral(left == right)
     if op == "!=":

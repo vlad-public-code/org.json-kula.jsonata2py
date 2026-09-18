@@ -530,10 +530,15 @@ class Translator(Visitor[str, GenCtx]):
         return f"({then} if is_truthy({cond}) else {otherwise})"
 
     def visit_elvis_expr(self, n: ElvisExpr, ctx: GenCtx) -> str:
-        return f"elvis({accept(n.left, self, ctx)}, {accept(n.right, self, ctx)})"
+        # The left operand is inspected (for truthiness), so it is not a tail
+        # position: a TCO sentinel there would be tested instead of the value.
+        left = accept(n.left, self, ctx.with_tail_position(False))
+        return f"elvis({left}, {accept(n.right, self, ctx)})"
 
     def visit_coalesce_expr(self, n: CoalesceExpr, ctx: GenCtx) -> str:
-        return f"coalesce({accept(n.left, self, ctx)}, {accept(n.right, self, ctx)})"
+        # Same as elvis: the left operand is inspected, not returned as-is.
+        left = accept(n.left, self, ctx.with_tail_position(False))
+        return f"coalesce({left}, {accept(n.right, self, ctx)})"
 
     def visit_partial_placeholder(self, n: PartialPlaceholder, ctx: GenCtx) -> str:
         if ctx.state.partial_ph_var is None:
@@ -1257,6 +1262,52 @@ class Translator(Visitor[str, GenCtx]):
             f"lambda_value(lambda {src_var}: fn_transform({src_var}, {loc_cb}, "
             f"{upd_cb}, {del_expr}), 1)"
         )
+
+
+# =============================================================================
+# Tail-position barrier
+# =============================================================================
+#
+# GenCtx.is_tail_position enables the fn_apply_tco trampoline, whose return
+# value is TCO_SENTINEL rather than the call's result -- only fn_apply may
+# observe it. The flag therefore has to survive exactly the positions that
+# are genuinely the value of the enclosing lambda body, and be cleared
+# everywhere else. Propagating it by default is what let the sentinel leak
+# into `{"v": $f(1)}`, `[$f(1)]`, `$f(1).y`, `$f(1) ?: x` and `$f(1) ?? x`.
+#
+# Rather than remembering to clear the flag at every one of the ~40 visit
+# sites, the default is inverted here: every visit_* method receives a ctx
+# with is_tail_position cleared unless it is listed as tail-transparent.
+_TAIL_TRANSPARENT: frozenset[str] = frozenset({
+    # The consumer of the flag.
+    "visit_function_call",
+    # Positions whose value *is* the enclosing body's value.
+    "visit_block",            # handled per-expression in block_codegen
+    "visit_conditional_expr",  # branches only; the condition clears it itself
+    "visit_elvis_expr",        # right operand only; left clears it itself
+    "visit_coalesce_expr",     # right operand only; left clears it itself
+    "visit_parenthesized",     # fully transparent
+})
+
+
+def _install_tail_barrier(cls: type) -> None:
+    def make(fn):  # type: ignore[no-untyped-def]
+        def wrapper(self, n, ctx):  # type: ignore[no-untyped-def]
+            if ctx.is_tail_position:
+                ctx = ctx.with_tail_position(False)
+            return fn(self, n, ctx)
+
+        wrapper.__name__ = fn.__name__
+        wrapper.__qualname__ = fn.__qualname__
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+
+    for name, fn in list(vars(cls).items()):
+        if name.startswith("visit_") and name not in _TAIL_TRANSPARENT and callable(fn):
+            setattr(cls, name, make(fn))
+
+
+_install_tail_barrier(Translator)
 
 
 def _source_chain_contains_force_array(node: AstNode) -> bool:
