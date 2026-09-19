@@ -670,7 +670,7 @@ from literal keys the translator has proved distinct skips `object_of`'s per-key
 duplicate check.
 
 **On the comparison with the Java sibling.** Its headline is ~40x over
-JSONata4Java and this port measures ~54x over `jsonata-python`, but the ratios
+JSONata4Java and this port measures ~61x over `jsonata-python`, but the ratios
 divide by different interpreters and are not comparable. The Java number comes
 from JIT-compiled bytecode replacing an AST walker; CPython has no JIT, so
 generated Python source runs on the very same interpreter. The win here is
@@ -756,7 +756,7 @@ workload it measured ~4.9x slower than jsonata2py.
 want the closest thing to the reference implementation and performance genuinely
 does not matter — a one-off script, a test fixture, a CLI that evaluates an
 expression once and exits. It is a pure-Python AST interpreter, which makes it easy
-to read and debug, but it evaluates ~54x slower than jsonata2py here. It does now
+to read and debug, but it evaluates ~61x slower than jsonata2py here. It does now
 compile ~2.8 ms *faster* — the one axis on which it leads — and a single
 evaluation is enough to give that back, so there is still no workload shape where
 it is the faster choice overall.
