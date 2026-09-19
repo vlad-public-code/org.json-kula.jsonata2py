@@ -816,8 +816,8 @@ The same parse → optimise → translate → compile pipeline exists for three 
 | Runtime | Project | Host code it generates | Speedup vs. that runtime's reference interpreter |
 |---|---|---|---|
 | JVM | **jsonata-jvm-compiler** (Java 21) — [docs](https://vlad-public-code.github.io/org.json-kula.jsonata-jvm-compiler/) · [Maven Central](https://mvnrepository.com/artifact/io.github.vlad-public-code/jsonata-jvm-compiler) · [source](https://github.com/vlad-public-code/org.json-kula.jsonata-jvm-compiler) | Java source, compiled in-memory by `javac` | ~56× vs [JSONata4Java](https://github.com/IBM/JSONata4Java) |
-| JavaScript | **jsonata2js** — [docs](https://vlad-public-code.github.io/org.json-kula.jsonata2js/) · [npm](https://www.npmjs.com/package/jsonata2js) · [source](https://github.com/vlad-public-code/org.json-kula.jsonata2js) | a JS function, loaded with `new Function` | ~53×–60× vs [`jsonata`](https://www.npmjs.com/package/jsonata) |
-| Python | **jsonata2py** (this project) — [docs](https://vlad-public-code.github.io/org.json-kula.jsonata2py/) · [PyPI](https://pypi.org/project/jsonata2py/) · [source](https://github.com/vlad-public-code/org.json-kula.jsonata2py) | Python source, compiled by the host `compile()` | ~54× vs [`jsonata-python`](https://pypi.org/project/jsonata-python/) |
+| JavaScript | **jsonata2js** — [docs](https://vlad-public-code.github.io/org.json-kula.jsonata2js/) · [npm](https://www.npmjs.com/package/jsonata2js) · [source](https://github.com/vlad-public-code/org.json-kula.jsonata2js) | a JS function, loaded with `new Function` | ~60× vs [`jsonata`](https://www.npmjs.com/package/jsonata) |
+| Python | **jsonata2py** (this project) — [docs](https://vlad-public-code.github.io/org.json-kula.jsonata2py/) · [PyPI](https://pypi.org/project/jsonata2py/) · [source](https://github.com/vlad-public-code/org.json-kula.jsonata2py) | Python source, compiled by the host `compile()` | ~61× vs [`jsonata-python`](https://pypi.org/project/jsonata-python/) |
 
 The JVM implementation is the original, and is the compiler behind [valem.run](https://valem.run/)'s reactive computation engine.
 
