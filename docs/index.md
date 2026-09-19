@@ -10,8 +10,8 @@ Port of [jsonata-jvm-compiler](https://vlad-public-code.github.io/org.json-kula.
 
 All 1,281 files of the [official JSONata test suite](https://github.com/jsonata-js/jsonata/blob/master/test/test-suite/TESTSUITE.md) pass.
 
-Evaluation is **~54x faster than the pure-Python reference interpreter**, and
-~2.7x-4.9x faster than both Rust-backed alternatives on this benchmark — including on
+Evaluation is **~61x faster than the pure-Python reference interpreter**, and
+~2.4x faster than the Rust-backed `jsonatapy` on this benchmark — including on
 JSON text in, JSON text out ([see the benchmarks](#performance)).
 
 ---
@@ -488,20 +488,30 @@ operations, arithmetic and a conditional.
 | | jsonata2py | [`jsonatapy`](https://pypi.org/project/jsonatapy/) | [`jsonata-rs`](https://pypi.org/project/jsonata-rs/) | [`jsonata-python`](https://pypi.org/project/jsonata-python/) |
 |---|---|---|---|---|
 | Implementation | translator, pure Python | native, Rust/PyO3 | native, Rust/PyO3 | interpreter, pure Python |
-| **Evaluation** (`dict`→`dict`) | **106 µs** | 285 µs | 517 µs † | 5 797 µs |
-| Relative | **baseline** | 2.69x slower | 4.88x slower † | 54.7x slower |
-| Throughput | **9 434/s** | 3 509/s | 1 934/s † | 173/s |
-| Cold compilation | 10.8 ms | **0.25 ms** | 1.11 ms † | 8.0 ms |
+| **Evaluation** (`dict`→`dict`) | **142 µs** | 345 µs | 517 µs † | 8 715 µs |
+| Relative | **baseline** | 2.43x slower | not comparable † | 61.4x slower |
+| Throughput | **7 042/s** | 2 899/s | 1 934/s † | 115/s |
+| Cold compilation | 10.7 ms | **0.34 ms** | 1.11 ms † | 8.0 ms |
 | Wheels on PyPI | pure Python (any platform) | 16, incl. Windows | 5 — **no Windows wheel** | pure Python (any platform) |
 
 Versions measured: jsonata2py 0.1.2, jsonatapy 2.2.7, jsonata-rs 0.1.4,
-jsonata-python 0.7.0 — each the latest PyPI release at the time. Figures are the
-pooled median of two 2026-09-05 runs, re-measured across four sessions.
+jsonata-python 0.7.0 — each the latest PyPI release at the time. Re-measured
+2026-09-19 after the code-review fixes, as the pooled median of several runs in
+one session.
 
-**Read this table with a ±10% error bar.** The two libraries that never changed
-drift that much between sessions (`jsonatapy` 250-285 µs, `jsonata-python`
-5 344-5 797 µs), and that drift is the yardstick: differences smaller than it are
-not differences.
+**Read this table with a ±10% error bar, and do not compare it row-for-row
+with the 2026-09-05 edition.** Every library measured slower this session —
+`jsonatapy` 345 µs against 285, `jsonata-python` 8 715 µs against 5 797, and
+jsonata2py 142 µs against 106 µs — while cold compilation was unchanged for
+both pure-Python libraries. That is this machine, not the code: run in the same
+session, the unchanged pre-fix build measured 144-155 µs. The ratios, which
+cancel the drift, are the durable part.
+
+**The code-review fixes are evaluation-neutral.** Three pairs alternating the
+pre-fix and fixed builds in one session gave medians of 147 µs and 151 µs, a
+difference that flips direction between pairs and sits inside the run-to-run
+spread. The group-by fix removes a quadratic blow-up on large buckets, which
+this benchmark's small buckets do not reach.
 
 **Compilation is slower than it was, and that is a deliberate cost.**
 Sequence-scan fusion generates a specialised loop per group, growing this
@@ -513,10 +523,12 @@ are cached. If you compile constantly and evaluate rarely, see
 
 † `jsonata-rs` and `jsonata-python` both install a top-level `jsonata` module and
 cannot coexist in one environment, so the `jsonata-rs` column (here and below) is
-carried over from an earlier session on the same machine with its ratios
-recomputed. That makes its 4.88x a floor rather than an estimate — scaled by the
-drift the unchanged libraries show, the like-for-like figure is ~5.5x. It is the
-row to re-measure in a shared environment rather than to read closely.
+carried over from an earlier session on the same machine and was NOT re-measured
+on 2026-09-19. Its 517 µs therefore comes from a session in which every library
+ran faster, so a ratio against this session's 142 µs would understate it and is left
+out rather than published. It is the row to re-measure in a shared environment.
+The per-size table below is carried over from the same session for the same
+reason.
 
 ### Why a pure-Python library beats two native ones here
 
