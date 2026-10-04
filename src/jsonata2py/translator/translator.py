@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from ..errors import TranslatorError
 from ..parser.ast_nodes import (
@@ -1338,7 +1338,7 @@ _TAIL_TRANSPARENT: frozenset[str] = frozenset({
 
 
 def _install_tail_barrier(cls: type) -> None:
-    def make(fn):  # type: ignore[no-untyped-def]
+    def make(fn: Any) -> Any:
         def wrapper(self, n, ctx):  # type: ignore[no-untyped-def]
             if ctx.is_tail_position:
                 ctx = ctx.with_tail_position(False)
