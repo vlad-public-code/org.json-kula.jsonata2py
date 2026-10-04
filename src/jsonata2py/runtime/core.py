@@ -37,6 +37,7 @@ __all__ = [
     "RESCAN",
     "JLambda",
     "JRegex",
+    "PackedArgs",
     "Preserved",
     "RangeHolder",
     # arithmetic
@@ -224,7 +225,6 @@ __all__ = [
     "object_of",
     "object_of_distinct",
     "or_",
-    "PackedArgs",
     "pack_args",
     "preserve_array",
     "range_",
