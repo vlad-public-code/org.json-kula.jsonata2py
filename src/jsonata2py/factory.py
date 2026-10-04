@@ -20,9 +20,10 @@ import threading
 import weakref
 from collections import OrderedDict
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 from . import _export_rewriter
+from .bindings import JsonataBindings
 from .errors import JsonataCompilationError, JsonataEvaluationError, LoadError, ParseError, TranslatorError
 from .expression import CompiledExpression
 from .library import JsonataLibrary, JsonataLibraryOptions, _ExportedJsonataFunction
@@ -166,7 +167,7 @@ class JsonataExpressionFactory:
                 # evaluation's environment: its bindings, overlaid with
                 # the block locals visible at the $eval call site.
                 bindings = _rt_ctx.bindings_for_nested_eval(locals_)
-                return compiled.evaluate(None if ctx is MISSING else ctx, bindings)
+                return compiled.evaluate(None if ctx is MISSING else ctx, cast("JsonataBindings", bindings))
             except JsonataCompilationError as e:
                 # T1005 means the text parsed but named a non-function --
                 # closer to "can't be evaluated" than "can't be parsed".
