@@ -519,10 +519,8 @@ class Parser:
         # Non-numeric predicate: for positional-binding or context-binding paths
         # (ending in #$var or @$var), fold the predicate as a path step so that
         # $i / $var is in scope during filtering.
-        if (
-            isinstance(source, PathExpr)
-            and len(source.steps) > 1
-            and _is_index_shaped(inner)
+        if isinstance(source, PathExpr) and len(source.steps) > 1 and (
+            _is_index_shaped(inner) or isinstance(source.steps[-1], ArrayConstructor)
         ):
             # An index-shaped predicate folds onto the last step, exactly as
             # the bare numeric subscript above does: `objs.t[[0]]` is the
@@ -531,6 +529,13 @@ class Parser:
             # from per-path apart -- a boolean one gives the same answer
             # either way, and folding those wholesale regresses this port's
             # own per-element scoping.
+            #
+            # An array-constructor last step is the exception: the reference
+            # pushes every filter onto the last step as a `stage`, and a
+            # constructor step's own array is what the stage filters --
+            # `objs.[1,2][$>1]` filters each element's own [1,2], giving
+            # [2,2], where filtering the collected path result compares the
+            # arrays themselves and raises T2010.
             steps = list(source.steps)
             steps[-1] = PredicateExpr(steps[-1], inner)
             return _new_path(steps)

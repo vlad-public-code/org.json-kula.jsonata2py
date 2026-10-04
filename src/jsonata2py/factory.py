@@ -128,7 +128,8 @@ class JsonataExpressionFactory:
         # compile-cache lock.
         self._eval_cache_lock = threading.Lock()
 
-        def eval_delegate(expr: str, ctx: Any) -> Any:
+        def eval_delegate(expr: str, ctx: Any, locals_: dict[str, Any] | None = None) -> Any:
+            from .runtime import context as _rt_ctx
             from .runtime.values import MISSING
 
             try:
@@ -161,7 +162,11 @@ class JsonataExpressionFactory:
                         ):
                             evicted_key, _ = self._eval_cache.popitem(last=False)
                             self._eval_cache_bytes -= len(evicted_key)
-                return compiled.evaluate(None if ctx is MISSING else ctx)
+                # The nested expression evaluates in the enclosing
+                # evaluation's environment: its bindings, overlaid with
+                # the block locals visible at the $eval call site.
+                bindings = _rt_ctx.bindings_for_nested_eval(locals_)
+                return compiled.evaluate(None if ctx is MISSING else ctx, bindings)
             except JsonataCompilationError as e:
                 # T1005 means the text parsed but named a non-function --
                 # closer to "can't be evaluated" than "can't be parsed".

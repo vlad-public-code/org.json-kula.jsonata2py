@@ -29,7 +29,7 @@ from typing import Any, cast
 from ..errors import _RuntimeEvaluationError as RuntimeEvaluationError
 from . import context as _ctx
 from .context import DEADLINE_STACK as _DEADLINE_STACK
-from .values import MISSING, JLambda, JRegex, Preserved, is_function, is_number, is_regex
+from .values import MISSING, JLambda, JRegex, PackedArgs, Preserved, is_function, is_number, is_regex
 
 __all__ = [
     "MISSING",
@@ -86,6 +86,7 @@ __all__ = [
     "filter_field_eq",
     "fn_abs",
     "fn_append",
+    "fn_append_all",
     "fn_apply",
     "fn_apply_tco",
     "fn_arg_count_error",
@@ -223,6 +224,7 @@ __all__ = [
     "object_of",
     "object_of_distinct",
     "or_",
+    "PackedArgs",
     "pack_args",
     "preserve_array",
     "range_",
@@ -1575,12 +1577,15 @@ def _is_truthy_uncommon(n: Any) -> bool:
 # =============================================================================
 
 
-def pack_args(*elements: Any) -> list[Any]:
+def pack_args(*elements: Any) -> PackedArgs:
     """Packs function arguments into a list WITHOUT flattening -- unlike
     array_of, which flattens list values. None (JSON null, D1) is a real
     argument value and is passed through as-is; only an actually-absent
-    slot should ever be MISSING, which callers pass explicitly."""
-    return list(elements)
+    slot should ever be MISSING, which callers pass explicitly.
+
+    The PackedArgs type is what tells a lambda body that it was given an
+    argument *list* rather than a single array argument."""
+    return PackedArgs(elements)
 
 
 def array(*elements: Any) -> list[Any]:
@@ -2006,8 +2011,8 @@ def fn_pad(str_: Any, width: Any, pad_char: Any = MISSING) -> Any:
     return _strings().fn_pad(str_, width, pad_char)
 
 
-def fn_eval(expr: Any, context: Any = MISSING) -> Any:
-    return _strings().fn_eval(expr, context)
+def fn_eval(expr: Any, context: Any = MISSING, locals_: dict[str, Any] | None = None) -> Any:
+    return _strings().fn_eval(expr, context, locals_)
 
 
 def fn_base64encode(str_: Any) -> Any:
@@ -2464,6 +2469,32 @@ def fn_append(a: Any, b: Any) -> Any:
     return result
 
 
+def fn_append_all(items: list[Any]) -> Any:
+    """The left fold of fn_append over `items`, in one pass.
+
+    Group-by used to accumulate a bucket with `grp[k] = fn_append(grp[k], e)`,
+    and fn_append copies the whole accumulated list every time -- O(n^2) in
+    the bucket size (20 000 items in one bucket took 424 ms). The fold is
+    reproduced exactly, including its two asymmetries: a MISSING operand is
+    skipped rather than flattened, and a single surviving item is returned
+    verbatim (so a lone `[3]` stays `[3]` while `[[1,2],[3]]` collapses to
+    `[1,2,3]`).
+    """
+    acc: Any = MISSING
+    out: list[Any] | None = None
+    for item in items:
+        if item is MISSING:
+            continue
+        if out is None:
+            if acc is MISSING:
+                acc = item
+                continue
+            out = []
+            _append_to_sequence(out, acc)
+        _append_to_sequence(out, item)
+    return acc if out is None else out
+
+
 def fn_reverse(arg: Any) -> Any:
     if arg is MISSING:
         return MISSING
@@ -2803,18 +2834,23 @@ def fn_each(obj: Any, fn: Any) -> Any:
     return _seq.fn_each(obj, tuple_callback(fn))
 
 
-def fn_sort(arr: Any, fn: Any = MISSING) -> Any:
+def fn_sort(arr: Any, fn: Any = MISSING, descending: bool = False) -> Any:
+    """`$sort(arr[, comparator])` and the generated form of `^(key)`.
+
+    `descending` is only ever set by the order-by codegen; the $sort built-in
+    has no such parameter and always sorts ascending.
+    """
     _seq = _sequences()
     require_function(fn, 2, optional=True)
     lambda_arity = _lambdas().lambda_arity
 
     if fn is MISSING:
-        return _seq.fn_sort(arr, None)
+        return _seq.fn_sort(arr, None, descending)
     if not isinstance(fn, JLambda):
-        return _seq.fn_sort(arr, fn)
+        return _seq.fn_sort(arr, fn, descending)
     if lambda_arity(fn) >= 2:
         return _seq.fn_sort_comparator(arr, tuple_callback(fn))
-    return _seq.fn_sort(arr, element_callback(fn))
+    return _seq.fn_sort(arr, element_callback(fn), descending)
 
 
 def fn_sort_comparator(arr: Any, comparator_fn: Callable[[Any], Any]) -> Any:
@@ -2979,8 +3015,22 @@ def fn_values(obj: Any) -> Any:
     return values if values else MISSING
 
 
-def fn_transform(source: Any, location_fn: Callable[[Any], Any], update_fn: Callable[[Any], Any], delete_fields: Any) -> Any:
-    """Implements the transform operator src ~> |location|update[,delete]|."""
+_T2012_MESSAGE = (
+    "The delete clause of the transform expression must evaluate to a string or array of strings"
+)
+
+
+def fn_transform(
+    source: Any,
+    location_fn: Callable[[Any], Any],
+    update_fn: Callable[[Any], Any],
+    delete_fn: Callable[[Any], Any] | None = None,
+) -> Any:
+    """Implements the transform operator src ~> |location|update[,delete]|.
+
+    delete_fn is evaluated per matched item, in that item's context, exactly
+    like update_fn -- the reference evaluates both against each match.
+    """
     if source is MISSING:
         return MISSING
     copy = _deep_copy(source)
@@ -2998,18 +3048,23 @@ def fn_transform(source: Any, location_fn: Callable[[Any], Any], update_fn: Call
                         "The update clause of the transform operator requires an object literal as the second operand",
                     )
                 target.update(update)
-            if delete_fields is not MISSING:
-                if not isinstance(delete_fields, str) and not isinstance(delete_fields, list):
-                    raise RuntimeEvaluationError(
-                        "T2012",
-                        "The delete clause of the transform operator is not valid, must be a string or array of strings",
-                    )
-                if isinstance(delete_fields, str):
-                    target.pop(delete_fields, None)
-                else:
-                    for f in delete_fields:
-                        if isinstance(f, str):
-                            target.pop(f, None)
+            if delete_fn is None:
+                continue
+            delete_fields = delete_fn(target)
+            if delete_fields is MISSING:
+                continue
+            if isinstance(delete_fields, str):
+                names: list[Any] = [delete_fields]
+            elif isinstance(delete_fields, list):
+                names = delete_fields
+            else:
+                raise RuntimeEvaluationError("T2012", _T2012_MESSAGE)
+            for f in names:
+                # A non-string element is an error, not something to skip:
+                # the reference reports T2012 for `|a|{}, [1]|`.
+                if not isinstance(f, str):
+                    raise RuntimeEvaluationError("T2012", _T2012_MESSAGE)
+                target.pop(f, None)
     return copy
 
 

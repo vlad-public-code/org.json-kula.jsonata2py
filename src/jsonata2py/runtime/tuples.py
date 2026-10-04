@@ -565,19 +565,32 @@ def force_array_tuples(tuples: list[Tuple]) -> list[Any]:
     return [t.v for t in tuples]
 
 
-def _append_binding(a: Any, b: Any) -> Any:
-    """`fn.append` over two binding values, which is how a bucket merges them."""
-    if a is MISSING:
-        return b
-    if b is MISSING:
-        return a
-    out: list[Any] = []
-    for part in (a, b):
-        if isinstance(part, list):
-            out.extend(part)
+def _append_binding_all(base: Any, values: list[Any]) -> Any:
+    """`fn.append` over a bucket's binding values, which is how a group-by
+    bucket merges them -- folded in one pass.
+
+    Folding pairwise re-copied the accumulated list per value, which is the
+    same quadratic shape group-by's fn_append had.
+    """
+    acc: Any = base
+    out: list[Any] | None = None
+    for val in values:
+        if val is MISSING:
+            continue
+        if out is None:
+            if acc is MISSING:
+                acc = val
+                continue
+            out = []
+            if isinstance(acc, list):
+                out.extend(acc)
+            else:
+                out.append(acc)
+        if isinstance(val, list):
+            out.extend(val)
         else:
-            out.append(part)
-    return out
+            out.append(val)
+    return acc if out is None else out
 
 
 def group_by_tuples(
@@ -625,14 +638,19 @@ def group_by_tuples(
         values = [t.v for t in data]
         context = MISSING if not values else (values[0] if len(values) == 1 else values)
         bindings = data[0].b
+        # One merged dict and one fold per name, instead of a fresh copy of
+        # the whole binding map per tuple: the old loop was quadratic in the
+        # bucket size for exactly the same reason group-by's fn_append was.
+        extra: dict[str, list[Any]] = {}
         for t in data[1:]:
             if not t.b:
                 continue
-            merged = dict(bindings) if bindings else {}
             for name, val in t.b.items():
-                merged[name] = _append_binding(
-                    bindings.get(name, MISSING) if bindings else MISSING, val
-                )
+                extra.setdefault(name, []).append(val)
+        if extra:
+            merged = dict(bindings) if bindings else {}
+            for name, vals in extra.items():
+                merged[name] = _append_binding_all(merged.get(name, MISSING), vals)
             bindings = merged
         value = pairs[pair_index][1](context, bindings)
         if value is not MISSING:
@@ -653,11 +671,13 @@ def sort_tuples(tuples: list[Tuple], key_fn: Callable[[Any, Any], Any], descendi
 
     # Sorting the *indices* rather than the tuples reuses fn_sort's key
     # validation, which is where T2007/T2008 come from.
-    order = fn_sort(list(range(len(tuples))), lambda i: key_fn(tuples[i].v, tuples[i].b))
-    ordered = [tuples[i] for i in order]
-    if descending:
-        ordered.reverse()
-    return ordered
+    # descending is passed through, not applied by reversing the ascending
+    # result: reversing swaps tied elements and moves missing keys to the
+    # front, neither of which the reference does.
+    order = fn_sort(
+        list(range(len(tuples))), lambda i: key_fn(tuples[i].v, tuples[i].b), descending
+    )
+    return [tuples[i] for i in order]
 
 
 def head_discarded(_evaluated: Any, result: Any) -> Any:

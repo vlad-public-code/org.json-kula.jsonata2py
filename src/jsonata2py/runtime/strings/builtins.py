@@ -550,6 +550,12 @@ def _expand_replacement(template: str, m: Any) -> str:
 # =============================================================================
 
 
+# Largest padded length $pad will build. Matches the sibling Java port's cap
+# (Java's practical maximum array length) so the three ports agree on where
+# $pad stops being an allocation and starts being an error.
+_MAX_PAD_WIDTH = (1 << 29) - 24
+
+
 def fn_pad(str_: Any, width: Any, pad_char: Any = MISSING) -> Any:
     if str_ is MISSING or width is MISSING:
         return MISSING
@@ -560,18 +566,21 @@ def fn_pad(str_: Any, width: Any, pad_char: Any = MISSING) -> Any:
     if pc == "":
         pc = " "
     cp_len = len(str_)
-    pc_cp_len = len(pc)
     abs_w = abs(w)
     if cp_len >= abs_w:
         return str_
+    # The width comes straight from input data, so an unbounded allocation
+    # here is a denial-of-service vector: $pad("a", 1e15) grew the process to
+    # 10.7 GB before the OS killed it. The reference throws a host-level
+    # RangeError ("Invalid array length") for the same input, which is not a
+    # JSONata error at all; report a proper JSONata error instead, at the same
+    # cap the sibling Java port uses.
+    if abs_w > _MAX_PAD_WIDTH:
+        raise RuntimeEvaluationError("D1001", f"Number out of range: {abs_w}")
     need = abs_w - cp_len
-    padding: list[str] = []
-    added = 0
-    while added < need:
-        take = min(pc_cp_len, need - added)
-        padding.append(pc[:take])
-        added += take
-    pad = "".join(padding)
+    # Repeat-and-slice instead of accumulating one-character slices in a
+    # Python loop: $pad("a", 30000000) took 5.1 s that way.
+    pad = (pc * (need // len(pc) + 1))[:need]
     return str_ + pad if w >= 0 else pad + str_
 
 
@@ -580,7 +589,13 @@ def fn_pad(str_: Any, width: Any, pad_char: Any = MISSING) -> Any:
 # =============================================================================
 
 
-def fn_eval(expr: Any, context: Any = MISSING) -> Any:
+def fn_eval(expr: Any, context: Any = MISSING, locals_: dict[str, Any] | None = None) -> Any:
+    """`$eval(text[, focus])`.
+
+    locals_ is supplied by generated code: a snapshot of the block locals
+    lexically visible at this call site, which the reference sees because it
+    evaluates the parsed text in the environment of the $eval call.
+    """
     from .. import context as _ctx
 
     if expr is MISSING:
@@ -589,7 +604,7 @@ def fn_eval(expr: Any, context: Any = MISSING) -> Any:
     if delegate is None:
         raise RuntimeEvaluationError(None, "$eval: no eval delegate registered (create a JsonataExpressionFactory first)")
     ctx = MISSING if context is MISSING else context
-    return delegate(_core.to_text(expr), ctx)
+    return delegate(_core.to_text(expr), ctx, locals_)
 
 
 # =============================================================================

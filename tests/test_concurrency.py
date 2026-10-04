@@ -303,12 +303,19 @@ def test_nested_eval_does_not_clobber_the_outer_local_binding():
     assert expr.evaluate(None) == 5
 
 
-def test_nested_eval_sees_its_own_context_not_the_outers_bindings():
-    # $eval's second argument is the context for the sub-expression; a
-    # bare $x inside it must NOT resolve to the outer block's $x -- $eval
-    # opens a genuinely separate frame.
+def test_nested_eval_sees_the_locals_visible_at_its_call_site():
+    # The reference evaluates $eval's text in the environment of the $eval
+    # call, so a lexically visible local IS in scope for it: the reference
+    # gives true here. (This used to assert False, which matched the port's
+    # old behaviour of opening a frame with no bindings at all -- PY-6.)
     expr = _FACTORY.compile('($x := 5; $eval("$exists($x)"))')
-    assert expr.evaluate(None) is False
+    assert expr.evaluate(None) is True
+
+
+def test_nested_eval_does_not_leak_its_own_locals_outwards():
+    # The inner frame is still separate in the other direction.
+    expr = _FACTORY.compile('($x := 1; $eval("($x := 2; $x)") + $x)')
+    assert expr.evaluate(None) == 3
 
 
 # =============================================================================

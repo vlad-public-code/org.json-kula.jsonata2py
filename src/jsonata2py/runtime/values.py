@@ -114,6 +114,25 @@ class Preserved(list[Any]):
     __slots__ = ()
 
 
+class PackedArgs(list[Any]):
+    """Marks a list as "several positional arguments", not one array value.
+
+    A lambda body unpacks its parameters out of the single value it is
+    applied to. Testing that value with `isinstance(x, list)` cannot tell
+    `$f(["a","b"])` -- one array argument -- from `$f("a","b")`, so a
+    multi-parameter lambda called with a single array argument had the array
+    spread across its parameters: `function($arr,$sep){$join($arr,$sep)}`
+    applied to `["a","b"]` joined `"a"` with separator `"b"`.
+
+    Only pack_args (and the built-ins that hand a callback its
+    [value, index, array] tuple) create this type, so an ordinary array
+    argument can no longer be mistaken for an argument list. A list subclass
+    rather than a wrapper, so every read path keeps working untouched.
+    """
+
+    __slots__ = ()
+
+
 def is_value(v: object) -> bool:
     """True for any value JSONata considers a "real" scalar/collection
     value (not MISSING)."""

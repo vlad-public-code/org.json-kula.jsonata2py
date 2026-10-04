@@ -15,10 +15,18 @@ from typing import Any
 
 from ..errors import _RuntimeEvaluationError as RuntimeEvaluationError
 from . import core as _core
-from .values import MISSING
+from .values import MISSING, PackedArgs
 
 
-def fn_sort(arg: Any, key_fn: Callable[[Any], Any] | None) -> Any:
+def fn_sort(arg: Any, key_fn: Callable[[Any], Any] | None, descending: bool = False) -> Any:
+    """`^(key)` / `$sort`. `descending` inverts the comparator -- it does NOT
+    reverse the ascending result.
+
+    The reference merge-sorts with a comparator that negates `comp` only
+    after the undefined checks have already `continue`d, so a missing key
+    sorts last in BOTH directions, and equal keys keep their input order.
+    Reversing an ascending sort gets both of those backwards: `items^(>a)`
+    over two items tied on `a` used to come out swapped."""
     key_fn = _core.deadline_guard(key_fn) if key_fn is not None else None
     if arg is MISSING:
         return MISSING
@@ -80,18 +88,25 @@ def fn_sort(arg: Any, key_fn: Callable[[Any], Any] | None) -> Any:
     # Keys are already extracted and validated to be all-number or
     # all-string; a native key-sort is a direct translation of cmp's rules
     # (MISSING/None sorts last) with no per-comparison Python call.
+    #
+    # A missing key must land last either way, so its rank is the one that
+    # ends up last under this direction: 1 ascending, 0 under reverse=True.
+    missing_rank = 0 if descending else 1
+    present_rank = 1 - missing_rank
     if has_number:
 
         def sort_key(i: int, _keys: list[Any] = keys) -> tuple[int, Any]:
             v = _keys[i]
-            return (1, 0.0) if (v is MISSING or v is None) else (0, float(v))
+            return (missing_rank, 0.0) if (v is MISSING or v is None) else (present_rank, float(v))
     else:
 
         def sort_key(i: int, _keys: list[Any] = keys) -> tuple[int, Any]:
             v = _keys[i]
-            return (1, "") if (v is MISSING or v is None) else (0, v)
+            return (missing_rank, "") if (v is MISSING or v is None) else (present_rank, v)
 
-    indices = sorted(range(len(items)), key=sort_key)
+    # sorted(reverse=True) is stable in CPython -- it does not reverse ties --
+    # so equal keys keep their input order, as the reference's merge sort does.
+    indices = sorted(range(len(items)), key=sort_key, reverse=descending)
     return [items[i] for i in indices]
 
 
@@ -118,7 +133,7 @@ def fn_sort_comparator(arg: Any, comparator_fn: Callable[[Any], Any]) -> Any:
         # is_truthy(compare([a, b])) else -1` -- makes `a < b` mean "not
         # (a after b)", i.e. a <= b, which is *true* for ties and swaps
         # every tied pair. Same call count, silently unstable.
-        return -1 if is_truthy(compare([b, a])) else 1
+        return -1 if is_truthy(compare(PackedArgs((b, a)))) else 1
 
     items.sort(key=functools.cmp_to_key(cmp))
     return items
@@ -284,7 +299,7 @@ def fn_reduce(arr: Any, fn: Callable[[Any], Any], init: Any) -> Any:
         acc = init
         start = 0
     for i in range(start, len(items)):
-        acc = fn([acc, items[i], i, items])
+        acc = fn(PackedArgs((acc, items[i], i, items)))
     return acc
 
 
@@ -297,7 +312,7 @@ def fn_map_indexed(arr: Any, fn: Callable[[Any], Any]) -> Any:
     items = list(arr) if isinstance(arr, list) else [arr]
     result: list[Any] = []
     for i, item in enumerate(items):
-        val = fn([item, i, arr])
+        val = fn(PackedArgs((item, i, arr)))
         if val is not MISSING:
             result.append(val)
     # A sequence, so a lone result collapses -- exactly as the one-parameter
@@ -379,7 +394,7 @@ def fn_sift(obj: Any, fn: Callable[[Any], Any]) -> Any:
         return MISSING
     result: dict[str, Any] = {}
     for k, v in obj.items():
-        if _core.is_truthy(fn([v, k, obj])):
+        if _core.is_truthy(fn(PackedArgs((v, k, obj)))):
             result[k] = v
     return result if result else MISSING
 
@@ -390,7 +405,7 @@ def fn_each(obj: Any, fn: Callable[[Any], Any]) -> Any:
         return MISSING
     result: list[Any] = []
     for k, v in obj.items():
-        r = fn([v, k, obj])
+        r = fn(PackedArgs((v, k, obj)))
         if r is not MISSING:
             result.append(r)
     return _core.unwrap(result)

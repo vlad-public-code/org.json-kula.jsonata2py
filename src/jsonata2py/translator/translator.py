@@ -530,10 +530,15 @@ class Translator(Visitor[str, GenCtx]):
         return f"({then} if is_truthy({cond}) else {otherwise})"
 
     def visit_elvis_expr(self, n: ElvisExpr, ctx: GenCtx) -> str:
-        return f"elvis({accept(n.left, self, ctx)}, {accept(n.right, self, ctx)})"
+        # The left operand is inspected (for truthiness), so it is not a tail
+        # position: a TCO sentinel there would be tested instead of the value.
+        left = accept(n.left, self, ctx.with_tail_position(False))
+        return f"elvis({left}, {accept(n.right, self, ctx)})"
 
     def visit_coalesce_expr(self, n: CoalesceExpr, ctx: GenCtx) -> str:
-        return f"coalesce({accept(n.left, self, ctx)}, {accept(n.right, self, ctx)})"
+        # Same as elvis: the left operand is inspected, not returned as-is.
+        left = accept(n.left, self, ctx.with_tail_position(False))
+        return f"coalesce({left}, {accept(n.right, self, ctx)})"
 
     def visit_partial_placeholder(self, n: PartialPlaceholder, ctx: GenCtx) -> str:
         if ctx.state.partial_ph_var is None:
@@ -783,7 +788,13 @@ class Translator(Visitor[str, GenCtx]):
         if name == "pad":
             return f"fn_pad({a[0]}, {a[1]})" if len(a) == 2 else f"fn_pad({a[0]}, {a[1]}, {a[2]})"
         if name == "eval":
-            return f"fn_eval({a[0]}, {ctx.ctx_var})" if len(a) == 1 else f"fn_eval({a[0]}, {a[1]})"
+            # The locals snapshot is what makes `( $x := 5; $eval("$x+1") )`
+            # 6: the reference evaluates the parsed text in the environment
+            # of the $eval call, so every lexically visible local is in
+            # scope for it.
+            snap = _visible_locals_snapshot(ctx)
+            focus = ctx.ctx_var if len(a) == 1 else a[1]
+            return f"fn_eval({a[0]}, {focus}, {snap})"
         if name == "base64encode":
             return f"fn_base64encode({ctx_arg(a, ctx.ctx_var)})"
         if name == "base64decode":
@@ -974,8 +985,9 @@ class Translator(Visitor[str, GenCtx]):
         result = src_expr
         for sk in reversed(n.keys):
             cb = self._sort_key_callback(sk.key, ctx)
-            sorted_call = f"fn_sort({result}, {cb})"
-            result = f"fn_reverse({sorted_call})" if sk.descending else sorted_call
+            # descending goes into fn_sort as an inverted comparator; reversing
+            # the ascending result would swap tied elements (PY-4).
+            result = f"fn_sort({result}, {cb}, {sk.descending})"
         # Two sources survive the sort without collapsing. A constructor's own
         # array is a `cons` value, and a cons value is not a sequence, so the
         # collapse does not apply: `a.[1]^(x)` is `[1]`, not `1`. A `[]`-wrapped
@@ -1031,8 +1043,7 @@ class Translator(Visitor[str, GenCtx]):
             result = src_expr
             for sk in reversed(n.keys):
                 cb = self._sort_key_callback(sk.key, ctx)
-                sorted_call = f"fn_sort({result}, {cb})"
-                result = f"fn_reverse({sorted_call})" if sk.descending else sorted_call
+                result = f"fn_sort({result}, {cb}, {sk.descending})"
             return f"unwrap({result})"
 
         if depth == 1:
@@ -1066,8 +1077,7 @@ class Translator(Visitor[str, GenCtx]):
             tuple_var = f"_tk{ctx.state.next_id()}"
             p_vars = [ref.replace("_TUPLE", tuple_var) for ref in parent_ref_exprs]
             key_expr = accept(sk.key, self, ctx.with_ctx(f"{tuple_var}[0]").with_parents(p_vars))
-            sorted_call = f"fn_sort({result}, lambda {tuple_var}: {key_expr})"
-            result = f"fn_reverse({sorted_call})" if sk.descending else sorted_call
+            result = f"fn_sort({result}, lambda {tuple_var}: {key_expr}, {sk.descending})"
         ext_var = f"_tex{ctx.state.next_id()}"
         return f"unwrap(fn_map({result}, lambda {ext_var}: {ext_var}[0]))"
 
@@ -1162,13 +1172,14 @@ class Translator(Visitor[str, GenCtx]):
             # itself an array: grouping `[[1,2],[3]]` under one key gives
             # `[1,2,3]`, and a lone `[3]` stays `[3]` because the first item
             # is stored verbatim.
-            body_lines.append(f"    if _kNode{pi} in {grp_var}:")
-            body_lines.append(
-                f"        {grp_var}[_kNode{pi}] = fn_append({grp_var}[_kNode{pi}], {elem_var})"
-            )
-            body_lines.append("    else:")
-            body_lines.append(f"        {grp_var}[_kNode{pi}] = {elem_var}")
-            body_lines.append(f"for _k{pi}, {elem_var} in {grp_var}.items():")
+            #
+            # The bucket is filled with plain appends and folded once at the
+            # end (fn_append_all). Calling fn_append per element copied the
+            # whole accumulated list each time, making a single large bucket
+            # quadratic in both time and allocation.
+            body_lines.append(f"    {grp_var}.setdefault(_kNode{pi}, []).append({elem_var})")
+            body_lines.append(f"for _k{pi}, _bucket{pi} in {grp_var}.items():")
+            body_lines.append(f"    {elem_var} = fn_append_all(_bucket{pi})")
             if ctx.primary_context_var is not None:
                 body_lines.append(f"    {ctx.primary_context_var} = {elem_var}")
             body_lines.append(f"    _v{pi} = {v_expr}")
@@ -1192,18 +1203,28 @@ class Translator(Visitor[str, GenCtx]):
     def visit_chain_expr(self, n: ChainExpr, ctx: GenCtx) -> str:
         expr = accept(n.steps[0], self, ctx)
         for step in n.steps[1:]:
-            fn_expr = self._chain_step_to_lambda(step, ctx)
-            expr = f"fn_pipe({expr}, {fn_expr})"
+            fn_expr, is_invocation = self._chain_step_to_lambda(step, ctx)
+            if is_invocation:
+                # A step WRITTEN as a call is an invocation, never a
+                # composition: `$f ~> $type()` asks for the type of $f, which
+                # is "function". fn_pipe composes whenever its left operand is
+                # a function value, so routing a call step through it returned
+                # a composed lambda instead of the answer. Composition stays
+                # for value steps -- `$trim ~> $uppercase`, no parentheses.
+                expr = f"fn_apply({fn_expr}, {expr})"
+            else:
+                expr = f"fn_pipe({expr}, {fn_expr})"
         return expr
 
-    def _chain_step_to_lambda(self, step: AstNode, ctx: GenCtx) -> str:
+    def _chain_step_to_lambda(self, step: AstNode, ctx: GenCtx) -> tuple[str, bool]:
+        """(callable expression, True when the step was written as a call)."""
         if isinstance(step, FunctionCall):
             args_with_pipe: list[AstNode] = [PartialPlaceholder(), *step.args]
-            return self.visit_partial_application(PartialApplication(step.name, args_with_pipe), ctx)
+            return self.visit_partial_application(PartialApplication(step.name, args_with_pipe), ctx), True
         staged = self._chain_step_stages(step, ctx)
         if staged is not None:
-            return staged
-        return accept(step, self, ctx)
+            return staged, True
+        return accept(step, self, ctx), False
 
     #: Postfix forms the reference records as `stages` on an apply node.
     _CHAIN_STAGES = (ForceArray, PredicateExpr, ArraySubscript, SortExpr)
@@ -1243,8 +1264,17 @@ class Translator(Visitor[str, GenCtx]):
         update = n.update
         loc_cb = emit_callback(pattern, ctx, "_tl", lambda v: accept(pattern, self, ctx.with_ctx(v)))
         upd_cb = emit_callback(update, ctx, "_tu", lambda v: accept(update, self, ctx.with_ctx(v)))
-        del_expr = accept(n.delete, self, ctx) if n.delete is not None else "MISSING"
-        return f"fn_transform({src_expr}, {loc_cb}, {upd_cb}, {del_expr})"
+        # The delete clause is evaluated against EACH matched item, like the
+        # update clause -- `$ ~> |a|{}, del|` deletes the key each item's own
+        # `del` field names. Evaluating it once in the outer context made it
+        # a lookup of a top-level `del` field, which is normally missing.
+        del_cb = self._transform_delete_callback(n.delete, ctx)
+        return f"fn_transform({src_expr}, {loc_cb}, {upd_cb}, {del_cb})"
+
+    def _transform_delete_callback(self, delete: AstNode | None, ctx: GenCtx) -> str:
+        if delete is None:
+            return "None"
+        return emit_callback(delete, ctx, "_td", lambda v: accept(delete, self, ctx.with_ctx(v)))
 
     def visit_transform_lambda(self, n: TransformLambda, ctx: GenCtx) -> str:
         src_var = f"_ts{ctx.state.next_id()}"
@@ -1252,11 +1282,79 @@ class Translator(Visitor[str, GenCtx]):
         update = n.update
         loc_cb = emit_callback(pattern, ctx, "_tl", lambda v: accept(pattern, self, ctx.with_ctx(v)))
         upd_cb = emit_callback(update, ctx, "_tu", lambda v: accept(update, self, ctx.with_ctx(v)))
-        del_expr = accept(n.delete, self, ctx) if n.delete is not None else "MISSING"
+        del_cb = self._transform_delete_callback(n.delete, ctx)
         return (
             f"lambda_value(lambda {src_var}: fn_transform({src_var}, {loc_cb}, "
-            f"{upd_cb}, {del_expr}), 1)"
+            f"{upd_cb}, {del_cb}), 1)"
         )
+
+
+def _visible_locals_snapshot(ctx: GenCtx) -> str:
+    """A dict literal mapping every lexically visible JSONata local name to
+    its current Python value, for `$eval` to evaluate its text against.
+
+    Innermost scope wins, which is what shadowing means:
+    `( $x := 5; ( $x := 9; $eval("$x") ) )` is 9.
+    """
+    refs: dict[str, str] = {}
+    for scope in reversed(ctx.state.scope_stack):
+        for jname in sorted(scope):
+            if jname in refs:
+                continue
+            if jname in ctx.state.holder_vars:
+                refs[jname] = f"{pyvar_ref(jname)}[0]"
+            else:
+                alias = ctx.state.get_alias(jname)
+                refs[jname] = alias if alias is not None else pyvar(jname)
+    if not refs:
+        return "None"
+    return "{" + ", ".join(f"{py_string(k)}: {v}" for k, v in refs.items()) + "}"
+
+
+# =============================================================================
+# Tail-position barrier
+# =============================================================================
+#
+# GenCtx.is_tail_position enables the fn_apply_tco trampoline, whose return
+# value is TCO_SENTINEL rather than the call's result -- only fn_apply may
+# observe it. The flag therefore has to survive exactly the positions that
+# are genuinely the value of the enclosing lambda body, and be cleared
+# everywhere else. Propagating it by default is what let the sentinel leak
+# into `{"v": $f(1)}`, `[$f(1)]`, `$f(1).y`, `$f(1) ?: x` and `$f(1) ?? x`.
+#
+# Rather than remembering to clear the flag at every one of the ~40 visit
+# sites, the default is inverted here: every visit_* method receives a ctx
+# with is_tail_position cleared unless it is listed as tail-transparent.
+_TAIL_TRANSPARENT: frozenset[str] = frozenset({
+    # The consumer of the flag.
+    "visit_function_call",
+    # Positions whose value *is* the enclosing body's value.
+    "visit_block",            # handled per-expression in block_codegen
+    "visit_conditional_expr",  # branches only; the condition clears it itself
+    "visit_elvis_expr",        # right operand only; left clears it itself
+    "visit_coalesce_expr",     # right operand only; left clears it itself
+    "visit_parenthesized",     # fully transparent
+})
+
+
+def _install_tail_barrier(cls: type) -> None:
+    def make(fn):  # type: ignore[no-untyped-def]
+        def wrapper(self, n, ctx):  # type: ignore[no-untyped-def]
+            if ctx.is_tail_position:
+                ctx = ctx.with_tail_position(False)
+            return fn(self, n, ctx)
+
+        wrapper.__name__ = fn.__name__
+        wrapper.__qualname__ = fn.__qualname__
+        wrapper.__doc__ = fn.__doc__
+        return wrapper
+
+    for name, fn in list(vars(cls).items()):
+        if name.startswith("visit_") and name not in _TAIL_TRANSPARENT and callable(fn):
+            setattr(cls, name, make(fn))
+
+
+_install_tail_barrier(Translator)
 
 
 def _source_chain_contains_force_array(node: AstNode) -> bool:
