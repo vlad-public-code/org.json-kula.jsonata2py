@@ -188,9 +188,9 @@ class _RewriteVisitor(Visitor[AstNode, None]):
         # NullLiteral() here would turn `false ? 1` into `null` and
         # `[false ? 1]` into `[null]` instead of `[]`. Leaving the node alone
         # lets the runtime produce the correct missing value.
-        if isinstance(condition, BooleanLiteral | NullLiteral) and otherwise is not None:
-            if isinstance(condition, NullLiteral) or not condition.value:
-                return otherwise
+        if (isinstance(condition, BooleanLiteral | NullLiteral) and otherwise is not None
+                and (isinstance(condition, NullLiteral) or not condition.value)):
+            return otherwise
 
         if condition is node.condition and then is node.then and otherwise is node.otherwise:
             return node
